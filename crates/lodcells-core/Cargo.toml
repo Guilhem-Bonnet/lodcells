@@ -1,0 +1,12 @@
+[package]
+name = "lodcells-core"
+description = "LOD discrets, cellules spatiales et sélection par erreur écran pour mondes ouverts (sans dépendance moteur)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+meshopt-rs = { version = "0.1", features = ["experimental"] }
+
+[dev-dependencies]

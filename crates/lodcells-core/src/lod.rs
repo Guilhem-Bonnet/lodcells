@@ -1,0 +1,211 @@
+//! Chaîne de LOD discrets d'un maillage.
+//!
+//! Chaque niveau est une simplification du précédent par `meshopt-rs` (port
+//! Rust pur de meshoptimizer : effondrements d'arêtes à métrique quadrique,
+//! bords de maillage préservés en priorité). L'erreur d'un niveau est
+//! **additive** : erreur propre + erreur du niveau précédent, donc
+//! strictement croissante — propriété qui rend la sélection monotone en
+//! distance (idée reprise de nanite-webgpu / Godotite).
+//!
+//! L'erreur propre d'une étape est mesurée ici (meshopt-rs 0.1 ne la renvoie
+//! pas) : distance maximale d'un sommet retiré au sommet conservé le plus
+//! proche — une borne simple et déterministe de la déviation de surface.
+
+use meshopt_rs::simplify::simplify;
+use meshopt_rs::vertex::Position;
+
+use crate::mesh::IndexedMesh;
+
+#[derive(Debug, Clone, Copy)]
+struct P([f32; 3]);
+
+impl Position for P {
+    fn pos(&self) -> [f32; 3] {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LodLevel {
+    pub mesh: IndexedMesh,
+    /// Erreur géométrique cumulée, en unités du maillage (rayon de déviation).
+    pub error: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LodChain {
+    /// Niveau 0 = maillage d'origine (erreur 0), puis de plus en plus grossier.
+    pub levels: Vec<LodLevel>,
+    /// Sphère englobante du niveau 0 (centre, rayon), partagée par tous les niveaux.
+    pub center: [f32; 3],
+    pub radius: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LodParams {
+    /// Fraction de triangles visée à chaque niveau (0,5 = moitié).
+    pub ratio: f32,
+    /// Nombre maximal de niveaux au-delà de l'origine.
+    pub max_levels: usize,
+    /// Arrêt si un niveau retire moins de cette fraction des triangles.
+    pub min_gain: f32,
+    /// Erreur maximale tolérée par étape, relative à l'échelle du maillage
+    /// (rayon de la sphère englobante).
+    pub target_error: f32,
+    /// Soudure par position avant simplification (0 = désactivée).
+    pub weld_tolerance: f32,
+}
+
+impl Default for LodParams {
+    fn default() -> Self {
+        LodParams { ratio: 0.5, max_levels: 4, min_gain: 0.1, target_error: 0.05, weld_tolerance: 1e-4 }
+    }
+}
+
+impl LodChain {
+    /// Construit la chaîne. Le niveau 0 est le maillage soudé (ou tel quel).
+    pub fn build(source: &IndexedMesh, params: &LodParams) -> LodChain {
+        let base = if params.weld_tolerance > 0.0 { source.weld(params.weld_tolerance).0 } else { source.clone() };
+        let (center, radius) = base.bounding_sphere();
+        let mut levels = vec![LodLevel { mesh: base, error: 0.0 }];
+        for _ in 0..params.max_levels {
+            let prev = levels.last().unwrap();
+            let want = ((prev.mesh.indices.len() as f32) * params.ratio) as usize / 3 * 3;
+            if want < 3 || prev.mesh.triangle_count() < 2 {
+                break;
+            }
+            let indices = simplify_indices(&prev.mesh, want, params.target_error * radius.max(1e-6));
+            let removed = prev.mesh.indices.len().saturating_sub(indices.len()) as f32 / prev.mesh.indices.len() as f32;
+            if indices.len() < 3 || removed < params.min_gain {
+                break;
+            }
+            let step = step_error(&prev.mesh, &indices);
+            let mesh = compact(&prev.mesh, indices);
+            let error = prev.error + step.max(1e-7 * radius.max(1.0));
+            levels.push(LodLevel { mesh, error });
+        }
+        LodChain { levels, center, radius }
+    }
+
+    pub fn len(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty()
+    }
+}
+
+fn simplify_indices(m: &IndexedMesh, target_indices: usize, target_error: f32) -> Vec<u32> {
+    let verts: Vec<P> = m.positions.iter().map(|&p| P(p)).collect();
+    let mut out = vec![0u32; m.indices.len()];
+    let n = simplify(&mut out, &m.indices, &verts, target_indices, target_error);
+    out.truncate(n);
+    out
+}
+
+/// Distance max d'un sommet retiré au sommet conservé le plus proche (le
+/// maillage simplifié référence un sous-ensemble des sommets d'origine).
+fn step_error(src: &IndexedMesh, kept_indices: &[u32]) -> f32 {
+    let mut kept = vec![false; src.positions.len()];
+    for &i in kept_indices {
+        kept[i as usize] = true;
+    }
+    let kept_pts: Vec<[f32; 3]> = src.positions.iter().zip(&kept).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+    if kept_pts.is_empty() {
+        return 0.0;
+    }
+    let mut worst = 0.0f32;
+    for (p, k) in src.positions.iter().zip(&kept) {
+        if *k {
+            continue;
+        }
+        let d2 = kept_pts
+            .iter()
+            .map(|q| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
+            .fold(f32::INFINITY, f32::min);
+        worst = worst.max(d2);
+    }
+    worst.sqrt()
+}
+
+/// Garde seulement les sommets référencés, renumérote.
+fn compact(src: &IndexedMesh, indices: Vec<u32>) -> IndexedMesh {
+    let mut remap = vec![u32::MAX; src.positions.len()];
+    let mut positions = Vec::new();
+    let indices = indices
+        .into_iter()
+        .map(|i| {
+            let slot = &mut remap[i as usize];
+            if *slot == u32::MAX {
+                positions.push(src.positions[i as usize]);
+                *slot = (positions.len() - 1) as u32;
+            }
+            *slot
+        })
+        .collect();
+    IndexedMesh { positions, indices }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grille plane N×N (2·(N−1)² triangles) : coplanaire, donc fortement
+    /// simplifiable sans erreur de surface, mais avec une erreur de
+    /// déplacement de sommets non nulle (notre borne).
+    pub(crate) fn grid(n: usize) -> IndexedMesh {
+        let mut positions = Vec::new();
+        for z in 0..n {
+            for x in 0..n {
+                positions.push([x as f32, 0.0, z as f32]);
+            }
+        }
+        let mut indices = Vec::new();
+        for z in 0..n - 1 {
+            for x in 0..n - 1 {
+                let a = (z * n + x) as u32;
+                let b = a + 1;
+                let c = a + n as u32;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, c, b, b, c, d]);
+            }
+        }
+        IndexedMesh::new(positions, indices)
+    }
+
+    #[test]
+    fn chain_is_monotonic_and_shrinks() {
+        let chain = LodChain::build(&grid(32), &LodParams { target_error: 1.0, ..Default::default() });
+        assert!(chain.len() >= 3, "niveaux : {}", chain.len());
+        assert_eq!(chain.levels[0].error, 0.0);
+        for w in chain.levels.windows(2) {
+            assert!(w[1].mesh.triangle_count() < w[0].mesh.triangle_count(), "chaque niveau est plus grossier");
+            assert!(w[1].error > w[0].error, "erreur strictement croissante");
+            let max = *w[1].mesh.indices.iter().max().unwrap() as usize;
+            assert!(max < w[1].mesh.positions.len(), "indices renumérotés");
+        }
+        assert!(chain.radius > 0.0);
+    }
+
+    #[test]
+    fn border_outline_is_preserved() {
+        let g = grid(16);
+        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() });
+        let coarse = &chain.levels.last().unwrap().mesh;
+        // les 4 coins de la grille sont des sommets de bord : ils survivent
+        for corner in [[0.0, 0.0, 0.0], [15.0, 0.0, 0.0], [0.0, 0.0, 15.0], [15.0, 0.0, 15.0]] {
+            assert!(coarse.positions.contains(&corner), "coin {corner:?} perdu");
+        }
+        // et l'enveloppe ne rétrécit pas
+        let (lo, hi) = coarse.aabb().unwrap();
+        assert_eq!((lo, hi), ([0.0, 0.0, 0.0], [15.0, 0.0, 15.0]));
+    }
+
+    #[test]
+    fn step_error_bounds_removed_vertices() {
+        let src = IndexedMesh::new(vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.5, 0.5, 2.0]], vec![0, 1, 2]);
+        // le sommet 3 (hors des indices gardés) est à 2,06 du plus proche conservé
+        assert!((step_error(&src, &[0, 1, 2]) - (0.25f32 + 0.25 + 4.0).sqrt()).abs() < 1e-5);
+    }
+}
