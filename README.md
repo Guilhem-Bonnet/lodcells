@@ -4,7 +4,7 @@ LOD discrets par maillage, cellules spatiales et sélection par erreur projetée
 
 Inspiré (idées, pas code) de Godotite (coupe en erreur-pixel, sélection incrémentale à « slack », validateur), nanite-webgpu (erreur additive monotone, sphère partagée, impostors) et des mécanismes natifs de Godot (MultiMesh, visibility ranges). Né pour un projet hôte.
 
-Licence MIT.
+Licence : au choix **MIT** ([LICENSE-MIT](LICENSE-MIT)) ou **Apache-2.0** ([LICENSE-APACHE](LICENSE-APACHE)). Plugin générique pour Godot 4.7 : aucun contenu de jeu tiers n'est inclus.
 
 ## Structure
 
@@ -84,3 +84,18 @@ Exports : `cell_size` (409,6 m), `visibility_end` (3 000 m), `threshold_px` (2),
 - 2026-10-29 — S06 : API incrémentale `add_cell` / `clear_cell` (MMI libérés, `cell_count` décroît, emplacements du sélecteur réemployés via `LodSelector.remove_cell`), construction des niveaux hors fil principal (`prepare_scene` + `reap`, `experimental-threads`), cache disque versionné des niveaux (relu identique octet à octet), MMI ancrées au centroïde de tuile ; mesure headless : `add_cell` après préparation 0,06 ms contre 5,26 ms en synchrone (grille 40×40) ; 47 vérifications dans `test_lodcells.gd`, 20 tests Rust.
 - 2026-10-29 — S04 : exports du nœud réellement appliqués (`max_levels` = 1 donne 4 MultiMesh contre 10), validation des entrées côté Rust et GDExtension (plus de panique sur `ratio` ≥ 1, indices hors plage, maillage vide), hystérésis 15 % (0 bascule sur 1 000 images d'oscillation contre > 900 sans), `add_cell` incrémental (1 évaluation au lieu de toutes), déplacement cumulé en `f64` (100 000 images à 0,5 m : écart de slack max 1,2e-5, contre 1e-3 dès l'image 1 789 en `f32`), clippy en CI.
 - 2026-10-28 — erreurs à l'échelle de l'exemplaire, sphère par centre de maillage, `step_error` en grille ; CI ; GDExtension + addon ; cœur.
+
+
+## Licence
+
+Au choix de l'utilisateur, sous l'une ou l'autre de ces licences :
+
+- licence Apache, version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) ou <https://www.apache.org/licenses/LICENSE-2.0>) ;
+- licence MIT ([LICENSE-MIT](LICENSE-MIT) ou <https://opensource.org/licenses/MIT>).
+
+Sauf mention contraire explicite, toute contribution soumise pour inclusion dans ce projet,
+au sens de la licence Apache-2.0, est placée sous cette double licence, sans condition
+supplémentaire.
+
+Dépendances : [godot-rust](https://github.com/godot-rust/gdext) (MPL-2.0) et
+[meshopt-rs](https://crates.io/crates/meshopt-rs) (MIT).
