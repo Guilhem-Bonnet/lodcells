@@ -18,9 +18,16 @@ extends Node3D
 @export var visibility_end := 3000.0
 ## Seuil d'erreur projetée (pixels) : plus petit = plus fin, plus de triangles.
 @export var threshold_px := 2.0
+## Paramètres du constructeur de niveaux (poussés vers LodBuilder avant chaque
+## construction : un changement après l'ajout n'affecte que les maillages
+## pas encore construits).
 @export var max_levels := 4
 @export var ratio := 0.5
 @export var target_error := 0.05
+@export var weld_tolerance := 0.0001
+## Marge d'hystérésis sur l'erreur projetée (0 = aucune) : évite le
+## clignotement quand la caméra oscille autour d'un seuil.
+@export var hysteresis := 0.15
 
 var instance_count := 0
 var multimesh_count := 0
@@ -114,6 +121,7 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 	if _builder == null:
 		_lod_cache[key] = result
 		return result
+	_apply_builder_params()
 	var per_surface: Array = []
 	var n_levels := 1 << 30
 	for s in mesh.get_surface_count():
@@ -121,6 +129,10 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 		var pos: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
 		var idx: Variant = arrays[Mesh.ARRAY_INDEX]
 		var r: Dictionary = _builder.build(pos, idx if idx != null else PackedInt32Array())
+		if r.is_empty():
+			# entrée refusée par la GDExtension (déjà signalée) : un seul niveau
+			_lod_cache[key] = result
+			return result
 		per_surface.append({"arrays": arrays, "r": r})
 		n_levels = mini(n_levels, (r["levels"] as Array).size())
 	if n_levels <= 1:
@@ -150,6 +162,17 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 	return result
 
 
+## Pousse les exports vers la GDExtension (les exports sont appliqués après
+## _init, d'où l'application juste avant usage).
+func _apply_builder_params() -> void:
+	if _builder == null:
+		return
+	_builder.max_levels = max_levels
+	_builder.ratio = ratio
+	_builder.target_error = target_error
+	_builder.weld_tolerance = weld_tolerance
+
+
 ## Chaîne d'erreurs du sélecteur pour un maillage à une échelle d'exemplaire
 ## donnée : les erreurs sont mesurées dans le repère du maillage, la caméra
 ## travaille dans celui de la scène — sans ce facteur, un GLB à l'échelle 0,1
@@ -176,6 +199,7 @@ func _process(_delta: float) -> void:
 	var cam := get_viewport().get_camera_3d()
 	if cam == null:
 		return
+	_selector.hysteresis = hysteresis
 	_selector.begin_frame(to_local(cam.global_position), cam.fov, get_viewport().get_visible_rect().size.y)
 	var changed: PackedInt32Array = _selector.select_changed(threshold_px)
 	for i in changed.size():

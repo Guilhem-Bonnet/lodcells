@@ -14,6 +14,6 @@ pub mod select;
 pub mod validate;
 
 pub use cells::{CellGrid, CellKey, Instance};
-pub use lod::{LodChain, LodLevel};
+pub use lod::{BuildError, LodChain, LodLevel, LodParams};
 pub use mesh::IndexedMesh;
 pub use select::{Camera, Selection, Selector};

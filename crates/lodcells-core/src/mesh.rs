@@ -44,6 +44,26 @@ impl IndexedMesh {
         (c, r)
     }
 
+    /// Nombre de sommets de bord : sommets touchés par une arête qui n'a pas
+    /// d'arête opposée (ouverte). Sert à mesurer ce que la simplification fait
+    /// aux contours (coutures entre tuiles).
+    pub fn border_vertex_count(&self) -> usize {
+        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in self.indices.as_chunks::<3>().0 {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a, b)).or_default() += 1;
+            }
+        }
+        let mut border = vec![false; self.positions.len()];
+        for &(a, b) in edges.keys() {
+            if !edges.contains_key(&(b, a)) {
+                border[a as usize] = true;
+                border[b as usize] = true;
+            }
+        }
+        border.iter().filter(|b| **b).count()
+    }
+
     /// Soudure par position : les sommets dont les positions tombent dans la
     /// même cellule de `tolerance` sont fusionnés. Renvoie le maillage soudé
     /// et, pour chaque sommet d'origine, l'indice du sommet soudé.
@@ -63,7 +83,7 @@ impl IndexedMesh {
         let mut indices: Vec<u32> = self.indices.iter().map(|&i| remap[i as usize]).collect();
         // triangles dégénérés par la soudure : retirés
         let mut kept = Vec::with_capacity(indices.len());
-        for t in indices.chunks_exact(3) {
+        for t in indices.as_chunks::<3>().0 {
             if t[0] != t[1] && t[1] != t[2] && t[0] != t[2] {
                 kept.extend_from_slice(t);
             }
@@ -91,6 +111,16 @@ mod tests {
         // un triangle dégénéré disparaît
         let m2 = IndexedMesh::new(vec![[0.0; 3], [0.0; 3], [1.0, 0.0, 0.0]], vec![0, 1, 2]);
         assert_eq!(m2.weld(0.01).0.triangle_count(), 0);
+    }
+
+    #[test]
+    fn border_vertex_count_of_a_quad() {
+        // deux triangles formant un carré : les 4 sommets sont de bord
+        let m = IndexedMesh::new(vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]], vec![0, 1, 2, 2, 1, 3]);
+        assert_eq!(m.border_vertex_count(), 4);
+        // tétraèdre fermé : aucun
+        let t = IndexedMesh::new(vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3]);
+        assert_eq!(t.border_vertex_count(), 0);
     }
 
     #[test]

@@ -34,6 +34,16 @@ func _init() -> void:
 	_check(max_idx < n_verts, "indices dans le tampon de sommets d'origine")
 	_check(float(r["radius"]) > 10.0, "rayon englobant plausible (%.1f)" % float(r["radius"]))
 
+	# 1b. Entrées invalides : erreur Godot propre, dictionnaire vide, pas de plantage
+	var bad = ClassDB.instantiate("LodBuilder")
+	bad.ratio = 2.0
+	_check(bad.build(arrays[Mesh.ARRAY_VERTEX], arrays[Mesh.ARRAY_INDEX]).is_empty(), "ratio = 2.0 refusé sans plantage")
+	bad.defaults()
+	_check(bad.build(arrays[Mesh.ARRAY_VERTEX], PackedInt32Array([0, 1, 99999])).is_empty(), "indice hors plage refusé")
+	_check(bad.build(arrays[Mesh.ARRAY_VERTEX], PackedInt32Array([0, -1, 2])).is_empty(), "indice négatif refusé")
+	_check(bad.build(PackedVector3Array(), PackedInt32Array()).is_empty(), "maillage vide refusé")
+	_check(not bad.build(arrays[Mesh.ARRAY_VERTEX], arrays[Mesh.ARRAY_INDEX]).is_empty(), "le même builder reconstruit ensuite")
+
 	# 2. LodSelector : deux cellules, près / loin
 	var sel = ClassDB.instantiate("LodSelector")
 	var chain: int = sel.add_chain(PackedFloat32Array([0.0, 0.05, 0.2, 0.8]))
@@ -45,6 +55,35 @@ func _init() -> void:
 	sel.begin_frame(Vector3(0, 0, -0.5), 70.0, 1080.0)
 	lv = sel.select_changed(2.0)
 	_check(lv[near] == -1 and lv[far] == -1 and sel.evaluated() == 0, "petit déplacement : rien réévalué (slack)")
+	# 2b. add_cell après begin_frame : ajout incrémental, seule la nouvelle cellule est évaluée
+	var third: int = sel.add_cell(chain, Vector3(0, 0, -300), 5.0)
+	sel.begin_frame(Vector3(0, 0, -0.5), 70.0, 1080.0)
+	lv = sel.select_changed(2.0)
+	_check(third == 2 and lv[near] == -1 and lv[far] == -1 and lv[third] >= 0 and sel.evaluated() == 1, "add_cell incrémental : 1 seule évaluation (%d)" % sel.evaluated())
+	_check(sel.add_cell(42, Vector3.ZERO, 1.0) == -1 and sel.cell_count() == 3, "chaîne inconnue refusée")
+	_check(sel.add_chain(PackedFloat32Array([0.0, 0.5, 0.2])) == -1, "erreurs non croissantes refusées")
+	_check(sel.select_changed(0.0).is_empty(), "seuil 0 px refusé")
+	# 2c. hystérésis : caméra oscillant de ±2 cm autour du seuil du niveau 1 de la
+	# cellule « près » (centre z = −20, rayon 5) : d_1 = 0,05·k/2 ⇒ z = −(25 + d_1).
+	# Sans hystérésis le niveau bascule à chaque image ; avec, plus jamais.
+	var k := 1080.0 / (2.0 * tan(deg_to_rad(35.0)))
+	var edge := 20.0 + 5.0 + 0.05 * k / 2.0
+	var flips := [0, 0]
+	var seen := [false, false]
+	for run in 2:
+		sel.hysteresis = 0.0 if run == 0 else 0.15
+		var last_level := -2
+		for f in 200:
+			var z := -edge + (0.02 if f % 2 == 0 else -0.02)
+			sel.begin_frame(Vector3(0, 0, z), 70.0, 1080.0)
+			var v: PackedInt32Array = sel.select_changed(2.0)
+			if v[near] >= 0:
+				seen[run] = true
+				if last_level != -2 and v[near] != last_level:
+					flips[run] += 1
+				last_level = v[near]
+	_check(seen[0] and flips[0] > 100, "sans hystérésis : la cellule clignote autour du seuil (%d bascules)" % flips[0])
+	_check(flips[1] == 0, "hystérésis : aucune bascule en oscillant autour d'un seuil (%d)" % flips[1])
 
 	# 3. Nœud LodCells : une scène avec la grille, 6 exemplaires sur 2 cellules
 	var node: Node3D = LodCellsScript.new()
@@ -64,6 +103,22 @@ func _init() -> void:
 	_check(node.lod_mesh_count == levels.size() - 1, "maillages de LOD construits une fois (%d)" % node.lod_mesh_count)
 	var am: ArrayMesh = node._lod_cache[grid.get_rid()]["meshes"][1]
 	_check(am.get_surface_count() == 1 and am.surface_get_arrays(0)[Mesh.ARRAY_NORMAL] != null, "les niveaux gardent les attributs (normales)")
+
+	# 4. Les exports du nœud atteignent LodBuilder : max_levels = 1 ⇒ moins de MultiMesh
+	var node1: Node3D = LodCellsScript.new()
+	node1.cell_size = 100.0
+	node1.target_error = 1.0
+	node1.max_levels = 1
+	get_root().add_child(node1)
+	node1.add_building(scene, xforms)
+	_check(node1.multimesh_count == 2 * 2 and node1.multimesh_count < node.multimesh_count, "max_levels=1 : %d MultiMesh vs %d avec 4" % [node1.multimesh_count, node.multimesh_count])
+	var node2: Node3D = LodCellsScript.new()
+	node2.cell_size = 100.0
+	node2.target_error = 1.0
+	node2.ratio = 2.0
+	get_root().add_child(node2)
+	node2.add_building(scene, xforms)
+	_check(node2.multimesh_count == 2 and node2.instance_count == 6, "ratio invalide : repli à un niveau, pas de plantage (%d)" % node2.multimesh_count)
 
 	scene.free()
 	if _fails == 0:

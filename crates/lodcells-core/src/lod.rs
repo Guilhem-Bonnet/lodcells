@@ -68,9 +68,67 @@ impl Default for LodParams {
     }
 }
 
+/// Entrée refusée par [`LodChain::build`]. Ces cas faisaient paniquer
+/// meshopt-rs (assertion `target_index_count <= indices.len()` pour un ratio
+/// ≥ 1, indexation hors tampon) ou produisaient une chaîne vide.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildError {
+    /// Aucun sommet ou aucun triangle.
+    EmptyMesh,
+    /// Le nombre d'indices n'est pas un multiple de 3.
+    IndexCountNotTriangles { count: usize },
+    /// Un indice dépasse le tampon de sommets.
+    IndexOutOfRange { index: u32, vertices: usize },
+    /// `ratio` doit être dans ]0, 1[.
+    InvalidRatio(f32),
+    /// `target_error`, `min_gain` ou `weld_tolerance` négatif ou NaN.
+    InvalidParam(&'static str),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::EmptyMesh => write!(f, "maillage vide (aucun sommet ou aucun triangle)"),
+            BuildError::IndexCountNotTriangles { count } => write!(f, "{count} indices : pas un multiple de 3"),
+            BuildError::IndexOutOfRange { index, vertices } => write!(f, "indice {index} hors du tampon de {vertices} sommets"),
+            BuildError::InvalidRatio(r) => write!(f, "ratio {r} hors de ]0, 1["),
+            BuildError::InvalidParam(p) => write!(f, "paramètre {p} négatif ou NaN"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+impl LodParams {
+    /// Vérifie les paramètres sans construire.
+    pub fn validate(&self) -> Result<(), BuildError> {
+        if self.ratio.is_nan() || self.ratio <= 0.0 || self.ratio >= 1.0 {
+            return Err(BuildError::InvalidRatio(self.ratio));
+        }
+        for (name, v) in [("target_error", self.target_error), ("min_gain", self.min_gain), ("weld_tolerance", self.weld_tolerance)] {
+            if v.is_nan() || v < 0.0 {
+                return Err(BuildError::InvalidParam(name));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl LodChain {
     /// Construit la chaîne. Le niveau 0 est le maillage soudé (ou tel quel).
-    pub fn build(source: &IndexedMesh, params: &LodParams) -> LodChain {
+    /// Refuse (sans paniquer) un maillage vide, des indices hors plage ou non
+    /// triangulaires, et des paramètres hors domaine.
+    pub fn build(source: &IndexedMesh, params: &LodParams) -> Result<LodChain, BuildError> {
+        params.validate()?;
+        if source.positions.is_empty() || source.indices.is_empty() {
+            return Err(BuildError::EmptyMesh);
+        }
+        if !source.indices.len().is_multiple_of(3) {
+            return Err(BuildError::IndexCountNotTriangles { count: source.indices.len() });
+        }
+        if let Some(&bad) = source.indices.iter().find(|&&i| i as usize >= source.positions.len()) {
+            return Err(BuildError::IndexOutOfRange { index: bad, vertices: source.positions.len() });
+        }
         // base soudée + représentant d'origine de chaque sommet soudé
         let (base, representative) = if params.weld_tolerance > 0.0 {
             let (welded, remap) = source.weld(params.weld_tolerance);
@@ -92,7 +150,8 @@ impl LodChain {
         for _ in 0..params.max_levels {
             let prev = levels.last().unwrap();
             let want = ((prev.mesh.indices.len() as f32) * params.ratio) as usize / 3 * 3;
-            if want < 3 || prev.mesh.triangle_count() < 2 {
+            // garde-fou : meshopt-rs exige want ≤ indices (ratio déjà validé < 1)
+            if want < 3 || want > prev.mesh.indices.len() || prev.mesh.triangle_count() < 2 {
                 break;
             }
             let indices = simplify_indices(&prev.mesh, want, params.target_error * radius.max(1e-6));
@@ -107,7 +166,7 @@ impl LodChain {
             let error = prev.error + step.max(1e-7 * radius.max(1.0));
             levels.push(LodLevel { mesh, error, source_indices });
         }
-        LodChain { levels, center, radius }
+        Ok(LodChain { levels, center, radius })
     }
 
     pub fn len(&self) -> usize {
@@ -279,7 +338,7 @@ mod tests {
 
     #[test]
     fn chain_is_monotonic_and_shrinks() {
-        let chain = LodChain::build(&grid(32), &LodParams { target_error: 1.0, ..Default::default() });
+        let chain = LodChain::build(&grid(32), &LodParams { target_error: 1.0, ..Default::default() }).unwrap();
         assert!(chain.len() >= 3, "niveaux : {}", chain.len());
         assert_eq!(chain.levels[0].error, 0.0);
         for w in chain.levels.windows(2) {
@@ -294,7 +353,7 @@ mod tests {
     #[test]
     fn border_outline_is_preserved() {
         let g = grid(16);
-        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() });
+        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() }).unwrap();
         let coarse = &chain.levels.last().unwrap().mesh;
         // les 4 coins de la grille sont des sommets de bord : ils survivent
         for corner in [[0.0, 0.0, 0.0], [15.0, 0.0, 0.0], [0.0, 0.0, 15.0], [15.0, 0.0, 15.0]] {
@@ -311,7 +370,7 @@ mod tests {
         let mut g = grid(8);
         g.positions.push(g.positions[9]);
         let n = g.positions.len();
-        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() });
+        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() }).unwrap();
         for l in &chain.levels {
             assert_eq!(l.source_indices.len(), l.mesh.indices.len());
             for (k, &s) in l.source_indices.iter().enumerate() {
@@ -323,6 +382,43 @@ mod tests {
         }
         // la copie soudée n'est jamais référencée : son représentant est le sommet 9
         assert!(chain.levels.iter().all(|l| !l.source_indices.contains(&64)));
+    }
+
+    #[test]
+    fn rejects_bad_inputs_instead_of_panicking() {
+        let g = grid(8);
+        let p = LodParams { target_error: 1.0, ..Default::default() };
+        // ratio ≥ 1 : meshopt-rs assertait `target_index_count <= indices.len()`
+        assert_eq!(LodChain::build(&g, &LodParams { ratio: 2.0, ..p.clone() }).unwrap_err(), BuildError::InvalidRatio(2.0));
+        assert_eq!(LodChain::build(&g, &LodParams { ratio: 1.0, ..p.clone() }).unwrap_err(), BuildError::InvalidRatio(1.0));
+        assert_eq!(LodChain::build(&g, &LodParams { ratio: 0.0, ..p.clone() }).unwrap_err(), BuildError::InvalidRatio(0.0));
+        assert!(LodChain::build(&g, &LodParams { ratio: f32::NAN, ..p.clone() }).is_err());
+        assert_eq!(LodChain::build(&g, &LodParams { target_error: -1.0, ..p.clone() }).unwrap_err(), BuildError::InvalidParam("target_error"));
+        // indices hors plage / non triangulaires / maillage vide
+        let mut bad = grid(8);
+        bad.indices[5] = 999;
+        assert_eq!(LodChain::build(&bad, &p).unwrap_err(), BuildError::IndexOutOfRange { index: 999, vertices: 64 });
+        let mut odd = grid(8);
+        odd.indices.pop();
+        assert!(matches!(LodChain::build(&odd, &p).unwrap_err(), BuildError::IndexCountNotTriangles { .. }));
+        assert_eq!(LodChain::build(&IndexedMesh::default(), &p).unwrap_err(), BuildError::EmptyMesh);
+        assert_eq!(LodChain::build(&IndexedMesh::new(vec![[0.0; 3]], vec![]), &p).unwrap_err(), BuildError::EmptyMesh);
+        // max_levels = 0 : un seul niveau, pas une erreur
+        assert_eq!(LodChain::build(&g, &LodParams { max_levels: 0, ..p.clone() }).unwrap().len(), 1);
+    }
+
+    /// Mesure (pas une garantie) : meshopt-rs 0.1 n'a pas d'option de
+    /// verrouillage des bords, il ne fait que les pondérer. Les sommets de
+    /// bord d'une grille 16×16 sont donc bien réduits par la simplification ;
+    /// seuls les coins et l'enveloppe survivent (cf. `border_outline_is_preserved`).
+    #[test]
+    fn border_vertices_are_not_locked_with_meshopt_rs_0_1() {
+        let chain = LodChain::build(&grid(16), &LodParams { target_error: 1.0, ..Default::default() }).unwrap();
+        let first = chain.levels[0].mesh.border_vertex_count();
+        let last = chain.levels.last().unwrap().mesh.border_vertex_count();
+        assert_eq!(first, 60, "grille 16×16 : 4·15 sommets de bord");
+        assert!(last < first, "bords non verrouillés : {first} → {last} sommets de bord");
+        eprintln!("sommets de bord grille 16×16 : {first} → {last} (niveau {})", chain.len() - 1);
     }
 
     #[test]

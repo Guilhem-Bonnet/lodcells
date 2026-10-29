@@ -28,7 +28,7 @@ pub fn validate(chain: &LodChain) -> Vec<Issue> {
             }
         }
         let n = l.mesh.positions.len() as u32;
-        for (t, tri) in l.mesh.indices.chunks_exact(3).enumerate() {
+        for (t, tri) in l.mesh.indices.as_chunks::<3>().0.iter().enumerate() {
             for &ix in tri {
                 if ix >= n {
                     issues.push(Issue::IndexOutOfRange { level: i, index: ix });

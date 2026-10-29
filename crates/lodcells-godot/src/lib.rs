@@ -5,12 +5,15 @@
 //!   d'origine (le GDScript reconstruit des ArrayMesh avec tous les attributs).
 //! - `LodSelector` : cellules enregistrées (centre, rayon, erreurs du maillage),
 //!   niveau par cellule d'après l'erreur projetée en pixels, sélection
-//!   incrémentale à « slack ».
+//!   incrémentale à « slack » et hystérésis.
+//!
+//! Toute entrée invalide est signalée par `godot_error!` et un résultat neutre
+//! (dictionnaire vide, −1, tableau vide) : jamais de panique côté moteur.
 
 use godot::prelude::*;
 use lodcells_core::lod::{LodChain, LodLevel, LodParams};
 use lodcells_core::mesh::IndexedMesh;
-use lodcells_core::select::{Camera, Selector};
+use lodcells_core::select::{Camera, Selector, DEFAULT_HYSTERESIS};
 
 struct LodCellsExtension;
 
@@ -20,20 +23,27 @@ unsafe impl ExtensionLibrary for LodCellsExtension {}
 #[derive(GodotClass)]
 #[class(base = RefCounted, init)]
 pub struct LodBuilder {
-    /// Fraction de triangles visée à chaque niveau.
+    /// Fraction de triangles visée à chaque niveau, dans ]0, 1[.
     #[var]
+    #[init(val = 0.5)]
     ratio: f32,
+    /// Nombre maximal de niveaux au-delà de l'origine (0 = un seul niveau).
     #[var]
+    #[init(val = 4)]
     max_levels: i64,
     /// Erreur maximale par étape, relative au rayon du maillage.
     #[var]
+    #[init(val = 0.05)]
     target_error: f32,
+    /// Soudure par position avant simplification (0 = désactivée).
     #[var]
+    #[init(val = 1e-4)]
     weld_tolerance: f32,
 }
 
 #[godot_api]
 impl LodBuilder {
+    /// Remet les paramètres par défaut de lodcells-core.
     #[func]
     fn defaults(&mut self) {
         let p = LodParams::default();
@@ -47,22 +57,35 @@ impl LodBuilder {
     /// (indices dans les sommets d'origine, niveau 0 inclus), "errors":
     /// PackedFloat32Array, "triangles": PackedInt32Array, "center": Vector3,
     /// "radius": float}. Un tableau d'indices vide = liste triangulaire 0..n.
+    /// Entrée invalide (ratio hors ]0,1[, indice hors plage ou négatif,
+    /// maillage vide…) : erreur Godot et dictionnaire vide.
     #[func]
     fn build(&self, positions: PackedVector3Array, indices: PackedInt32Array) -> VarDictionary {
         let positions: Vec<[f32; 3]> = positions.to_vec().iter().map(|v| [v.x, v.y, v.z]).collect();
-        let indices: Vec<u32> = if indices.is_empty() {
-            (0..positions.len() as u32).collect()
-        } else {
-            indices.to_vec().iter().map(|&i| i.max(0) as u32).collect()
-        };
+        let raw = indices.to_vec();
+        if let Some(&neg) = raw.iter().find(|&&i| i < 0) {
+            godot_error!("LodBuilder.build : indice négatif {neg}");
+            return VarDictionary::new();
+        }
+        let indices: Vec<u32> = if raw.is_empty() { (0..positions.len() as u32).collect() } else { raw.iter().map(|&i| i as u32).collect() };
+        if self.max_levels < 0 {
+            godot_error!("LodBuilder.build : max_levels {} négatif", self.max_levels);
+            return VarDictionary::new();
+        }
         let params = LodParams {
-            ratio: if self.ratio > 0.0 { self.ratio } else { 0.5 },
-            max_levels: if self.max_levels > 0 { self.max_levels as usize } else { 4 },
-            target_error: if self.target_error > 0.0 { self.target_error } else { 0.05 },
-            weld_tolerance: self.weld_tolerance.max(0.0),
+            ratio: self.ratio,
+            max_levels: self.max_levels as usize,
+            target_error: self.target_error,
+            weld_tolerance: self.weld_tolerance,
             ..LodParams::default()
         };
-        let chain = LodChain::build(&IndexedMesh::new(positions, indices), &params);
+        let chain = match LodChain::build(&IndexedMesh::new(positions, indices), &params) {
+            Ok(c) => c,
+            Err(e) => {
+                godot_error!("LodBuilder.build : {e}");
+                return VarDictionary::new();
+            }
+        };
         let mut levels: Array<PackedInt32Array> = Array::new();
         let mut errors = PackedFloat32Array::new();
         let mut triangles = PackedInt32Array::new();
@@ -94,32 +117,52 @@ struct Cell {
 pub struct LodSelector {
     chains: Vec<LodChain>,
     cells: Vec<Cell>,
-    selector: Option<Selector>,
+    selector: Selector,
     camera: Option<Camera>,
     last: Vec<i32>,
+    /// Marge d'hystérésis relative sur l'erreur projetée (0 = aucune).
+    #[var]
+    #[init(val = DEFAULT_HYSTERESIS)]
+    hysteresis: f32,
 }
 
 #[godot_api]
 impl LodSelector {
-    /// Déclare une chaîne par ses erreurs cumulées (niveau 0 = 0) ; renvoie son id.
+    /// Déclare une chaîne par ses erreurs cumulées (niveau 0 = 0) ; renvoie son
+    /// id, ou −1 si les erreurs ne sont pas croissantes / finies.
     #[func]
     fn add_chain(&mut self, errors: PackedFloat32Array) -> i64 {
-        let levels = errors
-            .to_vec()
-            .into_iter()
-            .map(|e| LodLevel { mesh: IndexedMesh::default(), error: e, source_indices: Vec::new() })
-            .collect();
+        let errors = errors.to_vec();
+        if errors.is_empty() || errors.iter().any(|e| !e.is_finite() || *e < 0.0) || errors.windows(2).any(|w| w[1] <= w[0]) {
+            godot_error!("LodSelector.add_chain : erreurs attendues finies, ≥ 0 et strictement croissantes ({errors:?})");
+            return -1;
+        }
+        let levels = errors.into_iter().map(|e| LodLevel { mesh: IndexedMesh::default(), error: e, source_indices: Vec::new() }).collect();
         self.chains.push(LodChain { levels, center: [0.0; 3], radius: 0.0 });
-        self.selector = None;
         (self.chains.len() - 1) as i64
     }
 
-    /// Enregistre une cellule (sphère englobante monde) d'une chaîne ; renvoie son id.
+    /// Enregistre une cellule (sphère englobante monde) d'une chaîne ; renvoie
+    /// son id. `chain` < 0 = pas de chaîne (toujours niveau 0) ; un id de
+    /// chaîne inconnu est refusé (−1). L'ajout est incrémental : les décisions
+    /// des autres cellules ne sont pas recalculées.
     #[func]
     fn add_cell(&mut self, chain: i64, center: Vector3, radius: f32) -> i64 {
-        let chain = usize::try_from(chain).ok();
+        let chain = if chain < 0 {
+            None
+        } else if (chain as usize) < self.chains.len() {
+            Some(chain as usize)
+        } else {
+            godot_error!("LodSelector.add_cell : chaîne {chain} inconnue ({} déclarées)", self.chains.len());
+            return -1;
+        };
+        if !radius.is_finite() || radius < 0.0 {
+            godot_error!("LodSelector.add_cell : rayon {radius} invalide");
+            return -1;
+        }
         self.cells.push(Cell { chain, center: [center.x, center.y, center.z], radius });
-        self.selector = None;
+        self.selector.push();
+        self.last.push(-1);
         (self.cells.len() - 1) as i64
     }
 
@@ -128,25 +171,33 @@ impl LodSelector {
         self.cells.len() as i64
     }
 
-    /// À appeler chaque image avant `select_all`.
+    /// À appeler chaque image avant `select_changed`. Caméra invalide (fov hors
+    /// ]0°, 180°[, hauteur ≤ 0) : erreur et image ignorée.
     #[func]
     fn begin_frame(&mut self, cam_pos: Vector3, fov_y_deg: f32, viewport_height: f32) {
-        let cam = Camera { position: [cam_pos.x, cam_pos.y, cam_pos.z], fov_y: fov_y_deg.to_radians(), viewport_height };
-        if self.selector.is_none() {
-            self.selector = Some(Selector::new(self.cells.len()));
-            self.last = vec![-1; self.cells.len()];
+        if fov_y_deg.is_nan() || fov_y_deg <= 0.0 || fov_y_deg >= 180.0 || viewport_height.is_nan() || viewport_height <= 0.0 || !cam_pos.is_finite() {
+            godot_error!("LodSelector.begin_frame : caméra invalide (fov {fov_y_deg}°, hauteur {viewport_height}, position {cam_pos})");
+            return;
         }
-        self.selector.as_mut().unwrap().begin_frame(&cam);
+        let cam = Camera { position: [cam_pos.x, cam_pos.y, cam_pos.z], fov_y: fov_y_deg.to_radians(), viewport_height };
+        self.selector.hysteresis = self.hysteresis;
+        self.selector.begin_frame(&cam);
         self.camera = Some(cam);
     }
 
     /// Niveau par cellule (−1 = inchangé depuis le dernier appel) ; les
-    /// cellules sans chaîne valide restent au niveau 0.
+    /// cellules sans chaîne restent au niveau 0. Tableau vide sans
+    /// `begin_frame` préalable ou si le seuil n'est pas > 0.
     #[func]
     fn select_changed(&mut self, threshold_px: f32) -> PackedInt32Array {
-        let (Some(sel), Some(cam)) = (self.selector.as_mut(), self.camera.as_ref()) else {
+        if threshold_px.is_nan() || threshold_px <= 0.0 {
+            godot_error!("LodSelector.select_changed : seuil {threshold_px} px invalide (attendu > 0)");
+            return PackedInt32Array::new();
+        }
+        let Some(cam) = self.camera.as_ref() else {
             return PackedInt32Array::new();
         };
+        let sel = &mut self.selector;
         let mut out = PackedInt32Array::new();
         out.resize(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
@@ -163,6 +214,6 @@ impl LodSelector {
     /// Nombre de cellules réévaluées lors du dernier `select_changed`.
     #[func]
     fn evaluated(&self) -> i64 {
-        self.selector.as_ref().map_or(0, |s| s.evaluated as i64)
+        self.selector.evaluated as i64
     }
 }
