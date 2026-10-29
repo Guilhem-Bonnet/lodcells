@@ -17,7 +17,7 @@ Licence MIT.
 | `tools/build.sh` | Compile l'extension et l'installe dans l'addon. |
 
 ```sh
-cargo test --workspace            # 19 tests Rust
+cargo test --workspace            # 20 tests Rust
 cargo clippy --workspace --all-targets -- -D warnings
 sh tools/build.sh                 # → godot/addons/lodcells/bin/liblodcells_godot.so
 godot --headless --path godot --import
@@ -37,11 +37,19 @@ godot --headless --path godot --script res://tests/test_lodcells.gd
 
 `LodBuilder` (RefCounted) — propriétés `ratio` (0,5), `max_levels` (4), `target_error` (0,05, relatif au rayon), `weld_tolerance` (1e-4) ; `defaults()` ; `build(positions: PackedVector3Array, indices: PackedInt32Array) -> Dictionary` `{levels: [PackedInt32Array…], errors, triangles, center, radius}`. Entrée invalide : `godot_error` + dictionnaire **vide**.
 
-`LodSelector` (RefCounted) — propriété `hysteresis` (0,15) ; `add_chain(errors: PackedFloat32Array) -> int` (erreurs finies, strictement croissantes, sinon −1) ; `add_cell(chain: int, center: Vector3, radius: float) -> int` (incrémental : n'invalide pas les autres cellules ; chaîne inconnue → −1 ; chaîne < 0 = toujours niveau 0) ; `begin_frame(cam_pos, fov_y_deg, viewport_height)` ; `select_changed(threshold_px) -> PackedInt32Array` (niveau par cellule, −1 = inchangé) ; `evaluated()` ; `cell_count()`.
+`LodSelector` (RefCounted) — propriété `hysteresis` (0,15) ; `add_chain(errors: PackedFloat32Array) -> int` (erreurs finies, strictement croissantes, sinon −1) ; `add_cell(chain: int, center: Vector3, radius: float) -> int` (incrémental : n'invalide pas les autres cellules ; chaîne inconnue → −1 ; chaîne < 0 = toujours niveau 0 ; réemploie l'emplacement d'une cellule retirée) ; `remove_cell(id) -> bool` (la cellule n'est plus évaluée, −1 dans `select_changed` ; id inconnu ou déjà retiré → false) ; `begin_frame(cam_pos, fov_y_deg, viewport_height)` ; `select_changed(threshold_px) -> PackedInt32Array` (niveau par cellule, −1 = inchangé) ; `evaluated()` ; `cell_count()` (cellules vivantes).
+
+La GDExtension est compilée avec `experimental-threads` : `LodBuilder` est instancié et appelé depuis des fils `WorkerThreadPool` (un builder par tâche, jamais partagé).
 
 ### Nœud `lod_cells.gd` (Node3D)
 
-Exports : `cell_size` (409,6 m), `visibility_end` (3 000 m), `threshold_px` (2), `max_levels`, `ratio`, `target_error`, `weld_tolerance`, `hysteresis`. Les quatre paramètres de construction sont poussés vers `LodBuilder` **avant chaque construction** (un changement après coup ne touche que les maillages pas encore construits). `add_building(scene: Node3D, xforms: Array[Transform3D], vis_end := -1.0)` ; diagnostics `evaluated_last_frame()`, `levels()`, compteurs `instance_count`, `multimesh_count`, `lod_mesh_count`, `cell_count`. Sans l'extension compilée : un seul niveau, pas de sélection (avertissement).
+Exports : `cell_size` (409,6 m), `visibility_end` (3 000 m), `threshold_px` (2), `max_levels`, `ratio`, `target_error`, `weld_tolerance`, `hysteresis`, `cache_dir` (`user://lodcache`, "" = pas de cache). Les quatre paramètres de construction sont poussés vers `LodBuilder` **avant chaque construction** et font partie de la clé du cache disque.
+
+- `add_cell(key, scene: Node3D, xforms: Array[Transform3D], vis_end := -1.0) -> int` : exemplaires d'une scène sous une clé (Vector2i de cellule de streaming, int, String…), plusieurs scènes par clé ; chaque `MultiMeshInstance3D` est ancrée au centroïde de sa tuile et ses exemplaires sont relatifs à cette ancre (petits nombres côté GPU loin de l'origine). `add_building(scene, xforms, vis_end)` = `add_cell` sous une clé automatique (entiers négatifs).
+- `clear_cell(key) -> bool` : libère les MMI de la clé ; `cell_count`, `instance_count`, `multimesh_count` décroissent, les emplacements du sélecteur sont réemployés. `has_cell(key)`, `cell_keys()`.
+- `prepare_scene(scene, budget_usec := 0) -> bool` / `prepare_mesh(mesh)` : construction des niveaux en `WorkerThreadPool` (tableaux de surface lus sur le fil principal — `surface_get_arrays` est un appel synchronisé du RenderingServer —, `LodBuilder` local à la tâche, `ArrayMesh` créés dans le fil) ; `reap()` récolte les tâches finies (nombre restant), `pending_count()`, `wait_all()`. Sans préparation, `add_cell` construit en synchrone.
+- Cache disque : `user://lodcache/<md5(positions, indices, paramètres)>.bin` = `"LODC"` + u32 `CACHE_VERSION` + `var_to_bytes({levels, errors, center, radius})`, relu identique octet à octet, ignoré (et réécrit) si la version diffère ; compteurs `cache_hits` / `cache_misses` ; `encode_cache` / `decode_cache` / `cache_key` statiques.
+- Diagnostics `evaluated_last_frame()`, `levels()` (cellules vivantes), compteurs `instance_count`, `multimesh_count`, `lod_mesh_count`, `cell_count`. Sans l'extension compilée : un seul niveau, pas de sélection (avertissement).
 
 ## Limites réelles (mesurées)
 
@@ -52,5 +60,6 @@ Exports : `cell_size` (409,6 m), `visibility_end` (3 000 m), `threshold_px` (2),
 
 ## Historique
 
+- 2026-10-29 — S06 : API incrémentale `add_cell` / `clear_cell` (MMI libérés, `cell_count` décroît, emplacements du sélecteur réemployés via `LodSelector.remove_cell`), construction des niveaux hors fil principal (`prepare_scene` + `reap`, `experimental-threads`), cache disque versionné des niveaux (relu identique octet à octet), MMI ancrées au centroïde de tuile ; mesure headless : `add_cell` après préparation 0,06 ms contre 5,26 ms en synchrone (grille 40×40) ; 47 vérifications dans `test_lodcells.gd`, 20 tests Rust.
 - 2026-10-29 — S04 : exports du nœud réellement appliqués (`max_levels` = 1 donne 4 MultiMesh contre 10), validation des entrées côté Rust et GDExtension (plus de panique sur `ratio` ≥ 1, indices hors plage, maillage vide), hystérésis 15 % (0 bascule sur 1 000 images d'oscillation contre > 900 sans), `add_cell` incrémental (1 évaluation au lieu de toutes), déplacement cumulé en `f64` (100 000 images à 0,5 m : écart de slack max 1,2e-5, contre 1e-3 dès l'image 1 789 en `f32`), clippy en CI.
 - 2026-10-28 — erreurs à l'échelle de l'exemplaire, sphère par centre de maillage, `step_error` en grille ; CI ; GDExtension + addon ; cœur.

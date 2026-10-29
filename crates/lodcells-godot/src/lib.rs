@@ -110,6 +110,8 @@ struct Cell {
     chain: Option<usize>,
     center: [f32; 3],
     radius: f32,
+    /// Emplacement libéré par `remove_cell` (réemployé par le prochain `add_cell`).
+    removed: bool,
 }
 
 #[derive(GodotClass)]
@@ -117,6 +119,9 @@ struct Cell {
 pub struct LodSelector {
     chains: Vec<LodChain>,
     cells: Vec<Cell>,
+    /// Emplacements libérés, réemployés en pile (les ids restent stables côté
+    /// moteur : un id libéré ne redevient valide qu'après réattribution).
+    free: Vec<usize>,
     selector: Selector,
     camera: Option<Camera>,
     last: Vec<i32>,
@@ -160,15 +165,45 @@ impl LodSelector {
             godot_error!("LodSelector.add_cell : rayon {radius} invalide");
             return -1;
         }
-        self.cells.push(Cell { chain, center: [center.x, center.y, center.z], radius });
+        let cell = Cell { chain, center: [center.x, center.y, center.z], radius, removed: false };
+        if let Some(i) = self.free.pop() {
+            // réemploi d'un emplacement libéré : décision en cache oubliée, niveau
+            // « dernier servi » remis à inconnu pour que select_changed le renvoie
+            self.cells[i] = cell;
+            self.selector.reset(i);
+            self.last[i] = -1;
+            return i as i64;
+        }
+        self.cells.push(cell);
         self.selector.push();
         self.last.push(-1);
         (self.cells.len() - 1) as i64
     }
 
+    /// Retire une cellule : son id n'est plus évalué (−1 dans `select_changed`)
+    /// et sera réattribué par un `add_cell` ultérieur. Renvoie false pour un id
+    /// inconnu ou déjà retiré (erreur Godot, pas de panique).
+    #[func]
+    fn remove_cell(&mut self, id: i64) -> bool {
+        let Some(c) = usize::try_from(id).ok().and_then(|i| self.cells.get_mut(i)) else {
+            godot_error!("LodSelector.remove_cell : cellule {id} inconnue ({} emplacements)", self.cells.len());
+            return false;
+        };
+        if c.removed {
+            godot_error!("LodSelector.remove_cell : cellule {id} déjà retirée");
+            return false;
+        }
+        c.removed = true;
+        c.chain = None;
+        self.selector.reset(id as usize);
+        self.free.push(id as usize);
+        true
+    }
+
+    /// Nombre de cellules vivantes (emplacements libérés exclus).
     #[func]
     fn cell_count(&self) -> i64 {
-        self.cells.len() as i64
+        (self.cells.len() - self.free.len()) as i64
     }
 
     /// À appeler chaque image avant `select_changed`. Caméra invalide (fov hors
@@ -201,6 +236,10 @@ impl LodSelector {
         let mut out = PackedInt32Array::new();
         out.resize(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
+            if c.removed {
+                out[i] = -1;
+                continue;
+            }
             let level = match c.chain.and_then(|k| self.chains.get(k)) {
                 Some(chain) if chain.len() > 1 => sel.select(i, chain, c.center, c.radius, cam, threshold_px).level as i32,
                 _ => 0,

@@ -85,10 +85,23 @@ func _init() -> void:
 	_check(seen[0] and flips[0] > 100, "sans hystérésis : la cellule clignote autour du seuil (%d bascules)" % flips[0])
 	_check(flips[1] == 0, "hystérésis : aucune bascule en oscillant autour d'un seuil (%d)" % flips[1])
 
+	# 2d. remove_cell : l'id libéré n'est plus évalué, cell_count décroît, le
+	# prochain add_cell réemploie l'emplacement et est réévalué.
+	_check(sel.remove_cell(third) and sel.cell_count() == 2, "remove_cell : cell_count 3 → 2 (%d)" % sel.cell_count())
+	_check(not sel.remove_cell(third) and not sel.remove_cell(42), "double retrait / id inconnu refusés sans plantage")
+	sel.begin_frame(Vector3(0, 0, -0.5), 70.0, 1080.0)
+	lv = sel.select_changed(2.0)
+	_check(lv.size() == 3 and lv[third] == -1, "cellule retirée : −1 dans select_changed")
+	var reused: int = sel.add_cell(chain, Vector3(0, 0, -300), 5.0)
+	sel.begin_frame(Vector3(0, 0, -0.5), 70.0, 1080.0)
+	lv = sel.select_changed(2.0)
+	_check(reused == third and lv[reused] >= 0 and sel.cell_count() == 3, "emplacement réemployé (%d) et réévalué (%d)" % [reused, lv[reused]])
+
 	# 3. Nœud LodCells : une scène avec la grille, 6 exemplaires sur 2 cellules
 	var node: Node3D = LodCellsScript.new()
 	node.cell_size = 100.0
 	node.target_error = 1.0
+	node.cache_dir = ""
 	get_root().add_child(node)
 	var scene := Node3D.new()
 	var mi := MeshInstance3D.new()
@@ -109,6 +122,7 @@ func _init() -> void:
 	node1.cell_size = 100.0
 	node1.target_error = 1.0
 	node1.max_levels = 1
+	node1.cache_dir = ""
 	get_root().add_child(node1)
 	node1.add_building(scene, xforms)
 	_check(node1.multimesh_count == 2 * 2 and node1.multimesh_count < node.multimesh_count, "max_levels=1 : %d MultiMesh vs %d avec 4" % [node1.multimesh_count, node.multimesh_count])
@@ -116,9 +130,123 @@ func _init() -> void:
 	node2.cell_size = 100.0
 	node2.target_error = 1.0
 	node2.ratio = 2.0
+	node2.cache_dir = ""
 	get_root().add_child(node2)
 	node2.add_building(scene, xforms)
 	_check(node2.multimesh_count == 2 and node2.instance_count == 6, "ratio invalide : repli à un niveau, pas de plantage (%d)" % node2.multimesh_count)
+
+	# 4b. Tampon d'instances (partagé par les niveaux) : matrice 3×4 en lignes,
+	# relative à l'ancre, composée avec la transformation de la pièce.
+	var xr := Transform3D(Basis(Vector3(0.3, 1, 0.2).normalized(), 1.1).scaled(Vector3(2, 2, 2)), Vector3(100, 5, -40))
+	var loc := Transform3D(Basis(Vector3.UP, 0.4), Vector3(1, 2, 3))
+	var anchor := Vector3(90, 0, -50)
+	var buf: PackedFloat32Array = LodCellsScript.instance_buffer([xr, Transform3D.IDENTITY], loc, anchor)
+	var back := Transform3D(Basis(Vector3(buf[0], buf[4], buf[8]), Vector3(buf[1], buf[5], buf[9]), Vector3(buf[2], buf[6], buf[10])), Vector3(buf[3], buf[7], buf[11]))
+	_check(buf.size() == 24 and back.is_equal_approx(Transform3D(xr.basis, xr.origin - anchor) * loc), "instance_buffer : 12 floats par exemplaire, lignes de (exemplaire − ancre) × pièce")
+
+	# 5. add_cell / clear_cell : deux clés, retrait de l'une, MMI libérés,
+	# compteurs décroissants, réemploi des emplacements du sélecteur.
+	var node5: Node3D = LodCellsScript.new()
+	node5.cell_size = 100.0
+	node5.target_error = 1.0
+	node5.cache_dir = ""
+	get_root().add_child(node5)
+	var xa: Array = xforms.slice(0, 3)   # une tuile
+	var xb: Array = xforms.slice(3, 6)   # l'autre tuile
+	var created_a: int = node5.add_cell(Vector2i(0, 0), scene, xa)
+	var created_b: int = node5.add_cell(Vector2i(0, 1), scene, xb)
+	var n_mmi_full := node5.get_child_count()
+	_check(created_a == 1 and created_b == 1 and node5.cell_count == 2 and node5.instance_count == 6, "add_cell : 2 clés → 2 cellules, 6 exemplaires (%d, %d)" % [node5.cell_count, node5.instance_count])
+	_check(node5.has_cell(Vector2i(0, 0)) and not node5.has_cell(Vector2i(9, 9)) and node5.cell_keys().size() == 2, "has_cell / cell_keys")
+	_check(node5.clear_cell(Vector2i(0, 0)) and not node5.clear_cell(Vector2i(0, 0)), "clear_cell : vrai une fois, faux ensuite")
+	_check(node5.cell_count == 1 and node5.instance_count == 3 and node5.multimesh_count == levels.size(), "après clear : 1 cellule, 3 exemplaires, %d MultiMesh (%d)" % [levels.size(), node5.multimesh_count])
+	_check(node5.get_child_count() == n_mmi_full - levels.size(), "MultiMeshInstance3D libérés de l'arbre (%d → %d)" % [n_mmi_full, node5.get_child_count()])
+	_check(node5._selector.cell_count() == 1 and node5.levels().size() == 1, "sélecteur : 1 cellule vivante, levels() sur les vivantes")
+	node5.add_cell(Vector2i(0, 0), scene, xa)
+	_check(node5.cell_count == 2 and node5._cells.size() == 2 and node5.get_child_count() == n_mmi_full, "ré-ajout : emplacement réemployé, pas de croissance (%d emplacements)" % node5._cells.size())
+	_check(node5.clear_cell(Vector2i(0, 0)) and node5.clear_cell(Vector2i(0, 1)) and node5.cell_count == 0 and node5.instance_count == 0 and node5.multimesh_count == 0 and node5.get_child_count() == 0, "tout retiré : compteurs à 0, aucun enfant")
+
+	# 6. Cache disque : écrit au premier build, relu au second (aucun LodBuilder
+	# appelé : cache_hits), octets identiques après ré-encodage, invalidé par version.
+	var dir := "user://lodcache-test"
+	var abs_dir := ProjectSettings.globalize_path(dir)
+	if DirAccess.dir_exists_absolute(abs_dir):
+		for f in DirAccess.get_files_at(abs_dir):
+			DirAccess.remove_absolute(abs_dir.path_join(f))
+	var node6: Node3D = LodCellsScript.new()
+	node6.cell_size = 100.0
+	node6.target_error = 1.0
+	node6.cache_dir = dir
+	get_root().add_child(node6)
+	node6.add_building(scene, xforms)
+	var files := DirAccess.get_files_at(abs_dir)
+	_check(node6.cache_misses == 1 and node6.cache_hits == 0 and files.size() == 1 and files[0].ends_with(".bin"), "premier build : 1 fichier de cache écrit, 1 miss (%s)" % [files])
+	var cache_path := dir.path_join(files[0])
+	var bytes := FileAccess.get_file_as_bytes(cache_path)
+	var desc: Dictionary = LodCellsScript.decode_cache(bytes)
+	_check(not desc.is_empty() and LodCellsScript.encode_cache(desc) == bytes, "relu puis ré-encodé : identique octet à octet (%d octets)" % bytes.size())
+	_check((desc["levels"] as Array).size() == levels.size() and desc["errors"] == errors, "le cache porte les mêmes niveaux et erreurs que LodBuilder")
+	var node7: Node3D = LodCellsScript.new()
+	node7.cell_size = 100.0
+	node7.target_error = 1.0
+	node7.cache_dir = dir
+	get_root().add_child(node7)
+	node7.add_building(scene, xforms)
+	_check(node7.cache_hits == 1 and node7.cache_misses == 0 and node7.multimesh_count == node6.multimesh_count and node7.lod_mesh_count == node6.lod_mesh_count, "second nœud : relu du cache (hit), mêmes MultiMesh (%d)" % node7.multimesh_count)
+	var am7: ArrayMesh = node7._lod_cache[grid.get_rid()]["meshes"][levels.size() - 1]
+	var am6: ArrayMesh = node6._lod_cache[grid.get_rid()]["meshes"][levels.size() - 1]
+	_check(am7.surface_get_arrays(0)[Mesh.ARRAY_INDEX] == am6.surface_get_arrays(0)[Mesh.ARRAY_INDEX], "dernier niveau identique construit / relu")
+	# version : on altère l'en-tête du fichier → ignoré, reconstruit et réécrit
+	var bad_bytes := bytes.duplicate()
+	bad_bytes.encode_u32(4, LodCellsScript.CACHE_VERSION + 1)
+	var fw := FileAccess.open(cache_path, FileAccess.WRITE)
+	fw.store_buffer(bad_bytes)
+	fw.close()
+	_check(LodCellsScript.decode_cache(bad_bytes).is_empty(), "autre version : décodage refusé")
+	var node8: Node3D = LodCellsScript.new()
+	node8.cell_size = 100.0
+	node8.target_error = 1.0
+	node8.cache_dir = dir
+	get_root().add_child(node8)
+	node8.add_building(scene, xforms)
+	_check(node8.cache_misses == 1 and FileAccess.get_file_as_bytes(cache_path) == bytes, "version périmée : reconstruit et fichier réécrit à l'identique")
+	# paramètres différents ⇒ autre clé
+	_check(LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 4}) != LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 2}), "la clé dépend des paramètres")
+
+	# 7. Construction hors fil principal : prepare_scene lance la tâche, reap()
+	# la récolte, add_cell n'a plus rien à construire (pas de LodBuilder sur le
+	# fil principal) ; un autre maillage, même scène.
+	var grid2 := _grid_mesh(40)
+	var scene2 := Node3D.new()
+	var mi2 := MeshInstance3D.new()
+	mi2.mesh = grid2
+	scene2.add_child(mi2)
+	var node9: Node3D = LodCellsScript.new()
+	node9.cell_size = 100.0
+	node9.target_error = 1.0
+	node9.cache_dir = ""
+	get_root().add_child(node9)
+	var ready0: bool = node9.prepare_scene(scene2)
+	var waited := 0
+	while node9.reap() > 0 and waited < 20000:
+		OS.delay_msec(1)
+		waited += 1
+	_check(not ready0 and node9.pending_count() == 0 and node9.prepare_scene(scene2), "prepare_scene : pas prêt, puis prêt après reap (%d ms)" % waited)
+	var t0 := Time.get_ticks_usec()
+	node9.add_cell(Vector2i(0, 0), scene2, xa)
+	var add_us := Time.get_ticks_usec() - t0
+	var t1 := Time.get_ticks_usec()
+	var node10: Node3D = LodCellsScript.new()
+	node10.cell_size = 100.0
+	node10.target_error = 1.0
+	node10.cache_dir = ""
+	get_root().add_child(node10)
+	node10.add_cell(Vector2i(0, 0), scene2, xa)
+	var sync_us := Time.get_ticks_usec() - t1
+	_check(node9.multimesh_count == node10.multimesh_count and node9.multimesh_count > 1, "niveaux identiques préparés en fil / construits en synchrone (%d MultiMesh)" % node9.multimesh_count)
+	print("  add_cell après préparation : %.2f ms ; synchrone : %.2f ms" % [add_us / 1000.0, sync_us / 1000.0])
+	_check(add_us < sync_us, "add_cell préparé plus rapide que la construction synchrone")
+	scene2.free()
 
 	scene.free()
 	if _fails == 0:

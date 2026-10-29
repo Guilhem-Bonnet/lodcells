@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 lodcells-core = { path = "../lodcells-core" }
-godot = { version = "0.5.5", features = ["api-4-7"] }
+godot = { version = "0.5.5", features = ["api-4-7", "experimental-threads"] }  # LodBuilder instancié et appelé depuis WorkerThreadPool (lod_cells.gd)

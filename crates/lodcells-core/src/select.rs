@@ -148,6 +148,15 @@ impl Selector {
         self.cache.len() - 1
     }
 
+    /// Oublie la décision en cache de l'exemplaire `i` (emplacement réemployé
+    /// par un autre exemplaire, ou retiré) : il sera réévalué au prochain
+    /// `select`. Index hors plage : sans effet.
+    pub fn reset(&mut self, i: usize) {
+        if let Some(slot) = self.cache.get_mut(i) {
+            *slot = None;
+        }
+    }
+
     /// Doit être appelé une fois par image avant `select` : accumule le
     /// déplacement de la caméra depuis la dernière réévaluation.
     pub fn begin_frame(&mut self, cam: &Camera) {
@@ -307,6 +316,25 @@ mod tests {
         // index au-delà de len() : extension, pas de panique
         sel.select(7, &c, [0.0; 3], 1.0, &cam(10.0), 2.0);
         assert_eq!(sel.len(), 8);
+    }
+
+    /// `reset(i)` : l'emplacement est réévalué au prochain `select`, les autres
+    /// gardent leur décision ; un index hors plage est ignoré.
+    #[test]
+    fn reset_reevaluates_only_that_slot() {
+        let c = chain(&[0.0, 0.01, 0.03]);
+        let mut sel = Selector::new(3);
+        sel.begin_frame(&cam(10.0));
+        for i in 0..3 {
+            sel.select(i, &c, [0.0; 3], 1.0, &cam(10.0), 2.0);
+        }
+        sel.reset(1);
+        sel.reset(99);
+        sel.begin_frame(&cam(10.0));
+        for i in 0..3 {
+            sel.select(i, &c, [0.0; 3], 1.0, &cam(10.0), 2.0);
+        }
+        assert_eq!((sel.len(), sel.evaluated), (3, 1), "seul l'emplacement remis à zéro est réévalué");
     }
 
     /// 100 000 images à 0,5 m par image (50 km, aller-retour sur 1 km en
