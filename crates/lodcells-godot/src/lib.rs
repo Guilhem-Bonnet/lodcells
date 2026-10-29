@@ -83,7 +83,8 @@ impl LodBuilder {
 }
 
 struct Cell {
-    chain: usize,
+    /// `None` : maillage à un seul niveau, jamais évalué (reste au niveau 0).
+    chain: Option<usize>,
     center: [f32; 3],
     radius: f32,
 }
@@ -116,7 +117,8 @@ impl LodSelector {
     /// Enregistre une cellule (sphère englobante monde) d'une chaîne ; renvoie son id.
     #[func]
     fn add_cell(&mut self, chain: i64, center: Vector3, radius: f32) -> i64 {
-        self.cells.push(Cell { chain: chain.max(0) as usize, center: [center.x, center.y, center.z], radius });
+        let chain = usize::try_from(chain).ok();
+        self.cells.push(Cell { chain, center: [center.x, center.y, center.z], radius });
         self.selector = None;
         (self.cells.len() - 1) as i64
     }
@@ -148,7 +150,7 @@ impl LodSelector {
         let mut out = PackedInt32Array::new();
         out.resize(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
-            let level = match self.chains.get(c.chain) {
+            let level = match c.chain.and_then(|k| self.chains.get(k)) {
                 Some(chain) if chain.len() > 1 => sel.select(i, chain, c.center, c.radius, cam, threshold_px).level as i32,
                 _ => 0,
             };

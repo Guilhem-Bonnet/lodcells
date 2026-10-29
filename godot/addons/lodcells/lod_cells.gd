@@ -29,7 +29,8 @@ var cell_count := 0
 
 var _builder: RefCounted
 var _selector: RefCounted
-var _lod_cache := {}   # RID du maillage → {"meshes": [Mesh…], "errors": PackedFloat32Array, "radius": float, "chain": int}
+var _lod_cache := {}   # RID du maillage → {"meshes": [Mesh…], "errors": PackedFloat32Array, "center": Vector3, "radius": float}
+var _chain_cache := {} # [RID, échelle] → chaîne du sélecteur (erreurs à l'échelle de la scène)
 var _cells := []       # id de cellule → {"mmis": [MultiMeshInstance3D…], "level": int}
 
 
@@ -47,10 +48,14 @@ static func available() -> bool:
 
 
 ## Ajoute tous les exemplaires (`xforms`, repère de ce nœud) d'une scène GLB.
-func add_building(scene: Node3D, xforms: Array) -> void:
+## `vis_end` : portée de masquage (m) pour cette scène, `visibility_end` par
+## défaut ; 0.0 = jamais masquée (terrain, repères lointains).
+func add_building(scene: Node3D, xforms: Array, vis_end := -1.0) -> void:
 	var parts := _parts(scene)
 	if parts.is_empty() or xforms.is_empty():
 		return
+	if vis_end < 0.0:
+		vis_end = visibility_end
 	var by_cell := {}
 	for x: Transform3D in xforms:
 		var key := Vector2i(floori(x.origin.x / cell_size), floori(x.origin.z / cell_size))
@@ -63,15 +68,18 @@ func add_building(scene: Node3D, xforms: Array) -> void:
 			var lod := _lods_for(p["mesh"])
 			var local: Transform3D = p["xform"]
 			var scale := maxf(local.basis.x.length(), maxf(local.basis.y.length(), local.basis.z.length()))
-			# sphère englobante de la cellule : centroïde des exemplaires, rayon
-			# = distance max au centroïde + rayon du maillage à l'échelle
+			# sphère englobante de la cellule : centroïde des centres de maillage
+			# transformés, rayon = distance max au centroïde + rayon du maillage à
+			# l'échelle (un maillage dont les sommets sont loin de son origine — une
+			# tuile de terrain — garde ainsi une sphère juste).
+			var center: Vector3 = lod["center"]
 			var centroid := Vector3.ZERO
 			for x: Transform3D in list:
-				centroid += (x * local).origin
+				centroid += (x * local) * center
 			centroid /= list.size()
 			var reach := 0.0
 			for x: Transform3D in list:
-				reach = maxf(reach, (x * local).origin.distance_to(centroid))
+				reach = maxf(reach, ((x * local) * center).distance_to(centroid))
 			var radius: float = reach + float(lod["radius"]) * scale
 			var mmis: Array = []
 			var meshes: Array = lod["meshes"]
@@ -84,12 +92,12 @@ func add_building(scene: Node3D, xforms: Array) -> void:
 					mm.set_instance_transform(i, list[i] * local)
 				var mmi := MultiMeshInstance3D.new()
 				mmi.multimesh = mm
-				mmi.visibility_range_end = visibility_end
+				mmi.visibility_range_end = vis_end
 				mmi.visible = level == 0
 				add_child(mmi)
 				mmis.append(mmi)
 				multimesh_count += 1
-			var cell_id: int = _selector.add_cell(int(lod["chain"]), centroid, radius) if _selector != null else _cells.size()
+			var cell_id: int = _selector.add_cell(_chain_for(lod, scale), centroid, radius) if _selector != null else _cells.size()
 			_cells.append({"mmis": mmis, "level": 0})
 			assert(cell_id == _cells.size() - 1)
 			cell_count += 1
@@ -101,13 +109,13 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 	var key := mesh.get_rid()
 	if _lod_cache.has(key):
 		return _lod_cache[key]
-	var result := {"meshes": [mesh], "errors": PackedFloat32Array([0.0]), "radius": 0.0, "chain": -1}
+	var aabb := mesh.get_aabb()
+	var result := {"meshes": [mesh], "errors": PackedFloat32Array([0.0]), "center": aabb.get_center(), "radius": aabb.size.length() * 0.5}
 	if _builder == null:
 		_lod_cache[key] = result
 		return result
 	var per_surface: Array = []
 	var n_levels := 1 << 30
-	var radius := 0.0
 	for s in mesh.get_surface_count():
 		var arrays := mesh.surface_get_arrays(s)
 		var pos: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
@@ -115,8 +123,6 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 		var r: Dictionary = _builder.build(pos, idx if idx != null else PackedInt32Array())
 		per_surface.append({"arrays": arrays, "r": r})
 		n_levels = mini(n_levels, (r["levels"] as Array).size())
-		radius = maxf(radius, float(r["radius"]) + (r["center"] as Vector3).length())
-	result["radius"] = radius
 	if n_levels <= 1:
 		_lod_cache[key] = result
 		return result
@@ -140,9 +146,28 @@ func _lods_for(mesh: Mesh) -> Dictionary:
 		lod_mesh_count += 1
 	result["meshes"] = meshes
 	result["errors"] = errors
-	result["chain"] = _selector.add_chain(errors)
 	_lod_cache[key] = result
 	return result
+
+
+## Chaîne d'erreurs du sélecteur pour un maillage à une échelle d'exemplaire
+## donnée : les erreurs sont mesurées dans le repère du maillage, la caméra
+## travaille dans celui de la scène — sans ce facteur, un GLB à l'échelle 0,1
+## verrait ses erreurs surestimées 10× et garderait ses niveaux fins trop loin.
+func _chain_for(lod: Dictionary, scale: float) -> int:
+	var errors: PackedFloat32Array = lod["errors"]
+	if errors.size() <= 1 or _selector == null:
+		return -1
+	var key := [lod["meshes"][0].get_rid(), snappedf(scale, 0.0001)]
+	if _chain_cache.has(key):
+		return _chain_cache[key]
+	var scaled := PackedFloat32Array()
+	scaled.resize(errors.size())
+	for i in errors.size():
+		scaled[i] = errors[i] * scale
+	var chain: int = _selector.add_chain(scaled)
+	_chain_cache[key] = chain
+	return chain
 
 
 func _process(_delta: float) -> void:

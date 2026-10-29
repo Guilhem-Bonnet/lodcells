@@ -138,18 +138,95 @@ fn step_error(src: &IndexedMesh, kept_indices: &[u32]) -> f32 {
     if kept_pts.is_empty() {
         return 0.0;
     }
+    let grid = PointGrid::new(&kept_pts);
     let mut worst = 0.0f32;
     for (p, k) in src.positions.iter().zip(&kept) {
-        if *k {
-            continue;
+        if !*k {
+            worst = worst.max(grid.nearest_d2(*p));
         }
-        let d2 = kept_pts
-            .iter()
-            .map(|q| (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
-            .fold(f32::INFINITY, f32::min);
-        worst = worst.max(d2);
     }
     worst.sqrt()
+}
+
+/// Grille uniforme de points pour les requêtes « plus proche voisin » de
+/// `step_error` : la version naïve était en O(retirés × conservés), soit
+/// plusieurs secondes par tuile de terrain de 16 k sommets.
+struct PointGrid {
+    pts: Vec<[f32; 3]>,
+    min: [f32; 3],
+    h: f32,
+    dims: [usize; 3],
+    /// Par cellule : indices des points qu'elle contient.
+    cells: Vec<Vec<u32>>,
+}
+
+impl PointGrid {
+    const MAX_DIM: usize = 64;
+
+    fn new(pts: &[[f32; 3]]) -> Self {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for p in pts {
+            for a in 0..3 {
+                min[a] = min[a].min(p[a]);
+                max[a] = max[a].max(p[a]);
+            }
+        }
+        let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+        let longest = extent.iter().cloned().fold(0.0f32, f32::max).max(1e-6);
+        // ~2 points par cellule occupée, sans dépasser MAX_DIM cellules par axe.
+        let volume = extent.iter().map(|e| e.max(longest * 1e-3)).product::<f32>();
+        let h = (volume / (pts.len() as f32 / 2.0)).cbrt().max(longest / Self::MAX_DIM as f32);
+        let dims = [0, 1, 2].map(|a| ((extent[a] / h).floor() as usize + 1).min(Self::MAX_DIM));
+        let mut g = PointGrid { pts: pts.to_vec(), min, h, dims, cells: vec![Vec::new(); dims[0] * dims[1] * dims[2]] };
+        for (i, p) in pts.iter().enumerate() {
+            let k = g.flat(g.cell_of(*p));
+            g.cells[k].push(i as u32);
+        }
+        g
+    }
+
+    fn cell_of(&self, p: [f32; 3]) -> [usize; 3] {
+        [0, 1, 2].map(|a| (((p[a] - self.min[a]) / self.h).floor().max(0.0) as usize).min(self.dims[a] - 1))
+    }
+
+    fn flat(&self, c: [usize; 3]) -> usize {
+        (c[2] * self.dims[1] + c[1]) * self.dims[0] + c[0]
+    }
+
+    /// Carré de la distance de `p` au point le plus proche de la grille :
+    /// anneaux de cellules de rayon croissant (Tchebychev), arrêt dès que le
+    /// meilleur candidat est plus près que tout ce que l'anneau suivant peut
+    /// contenir.
+    fn nearest_d2(&self, p: [f32; 3]) -> f32 {
+        let c = self.cell_of(p);
+        let max_r = *self.dims.iter().max().unwrap();
+        let mut best = f32::INFINITY;
+        for r in 0..=max_r {
+            let lo = [0, 1, 2].map(|a| c[a].saturating_sub(r));
+            let hi = [0, 1, 2].map(|a| (c[a] + r).min(self.dims[a] - 1));
+            for z in lo[2]..=hi[2] {
+                for y in lo[1]..=hi[1] {
+                    for x in lo[0]..=hi[0] {
+                        let on_ring = [x, y, z].iter().zip(&c).any(|(&v, &cv)| v.abs_diff(cv) == r);
+                        if !on_ring {
+                            continue;
+                        }
+                        for &i in &self.cells[self.flat([x, y, z])] {
+                            let q = self.pts[i as usize];
+                            let d2 = (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2);
+                            best = best.min(d2);
+                        }
+                    }
+                }
+            }
+            // Tout point d'un anneau > r est à au moins r·h de p (p est dans la cellule c).
+            if best <= (r as f32 * self.h).powi(2) {
+                break;
+            }
+        }
+        best
+    }
 }
 
 /// Garde seulement les sommets référencés, renumérote ; renvoie aussi, pour
