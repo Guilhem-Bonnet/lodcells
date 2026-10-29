@@ -258,6 +258,50 @@ func _init() -> void:
 	_check(add_us < sync_us, "add_cell préparé plus rapide que la construction synchrone")
 	scene2.free()
 
+	# 8. STAB : reap(budget) n'assemble qu'une partie des résultats finis par
+	# appel ; forget_mesh rend les niveaux (lod_mesh_count), refuse l'inconnu,
+	# et un add_cell ultérieur reconstruit.
+	var node11: Node3D = LodCellsScript.new()
+	node11.cell_size = 100.0
+	node11.target_error = 1.0
+	node11.cache_dir = ""
+	get_root().add_child(node11)
+	var grids: Array = []
+	for i in 6:
+		var g := _grid_mesh(30 + 3 * i)
+		grids.append(g)
+		node11.prepare_mesh(g)
+	# Les 6 tâches (grilles ≤ 45²) finissent en quelques ms ; reap(1 µs) libère
+	# les tâches mais n'assemble qu'au plus un résultat par appel.
+	OS.delay_msec(300)
+	var left1: int = node11.reap(1)
+	var calls := 1
+	while left1 > 0 and calls < 200:
+		OS.delay_msec(50)
+		left1 = node11.reap(1)
+		calls += 1
+	var after1: int = node11.unassembled_count()
+	node11.reap()
+	_check(left1 == 0 and after1 >= 6 - calls and (calls >= 6 or after1 >= 1) and node11.unassembled_count() == 0,
+		"reap sous budget : %d résultats non assemblés après %d reap(1 µs), 0 après reap()" % [after1, calls])
+	var before_lm: int = node11.lod_mesh_count
+	_check(before_lm >= 6, "%d maillages de niveaux construits pour 6 grilles" % before_lm)
+	var scene3 := Node3D.new()
+	var mi3 := MeshInstance3D.new()
+	mi3.mesh = grids[0]
+	scene3.add_child(mi3)
+	node11.add_cell(Vector2i(0, 0), scene3, xa)
+	var mm_before: int = node11.multimesh_count
+	node11.clear_cell(Vector2i(0, 0))
+	_check(node11.forget_mesh(grids[0]) and not node11.forget_mesh(grids[0]), "forget_mesh : vrai une fois, faux ensuite")
+	_check(node11.lod_mesh_count < before_lm, "lod_mesh_count décroît (%d → %d)" % [before_lm, node11.lod_mesh_count])
+	_check(node11.forget_scene(scene3) == 0, "forget_scene : plus rien à oublier pour cette scène")
+	node11.add_cell(Vector2i(0, 0), scene3, xa)
+	_check(node11.multimesh_count == mm_before and node11.lod_mesh_count == before_lm, "add_cell après oubli : niveaux reconstruits (%d MultiMesh)" % node11.multimesh_count)
+	var unknown_mesh := ArrayMesh.new()
+	_check(not node11.forget_mesh(unknown_mesh), "forget_mesh d'un maillage inconnu : faux")
+	scene3.free()
+
 	scene.free()
 	if _fails == 0:
 		print("TEST LODCELLS OK")

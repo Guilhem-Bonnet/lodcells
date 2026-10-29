@@ -19,8 +19,16 @@ extends Node3D
 ##       des niveaux de LOD des maillages de la scène (LodBuilder.build est du
 ##       Rust pur ; chaque tâche instancie son propre LodBuilder) ; renvoie true
 ##       quand tout est prêt. reap() libère les tâches finies (à appeler
-##       régulièrement) et renvoie le nombre encore en cours. Sans préparation,
-##       add_cell construit en synchrone sur le fil principal.
+##       régulièrement) et renvoie le nombre encore en cours ; reap(budget_usec)
+##       n'assemble les ArrayMesh des niveaux (fil principal) que tant que le
+##       budget n'est pas dépassé, le reste attend l'appel suivant. Sans
+##       préparation, add_cell construit en synchrone sur le fil principal.
+##   forget_scene(scene) -> int / forget_mesh(mesh) -> bool   oublie les niveaux
+##       construits d'un maillage (mémoire rendue : ArrayMesh des niveaux > 0 et
+##       chaîne du sélecteur) ; à n'appeler que lorsqu'aucune cellule vivante ne
+##       l'utilise (sinon ses MultiMesh gardent leurs maillages, mais un nouvel
+##       add_cell les reconstruirait). Un maillage encore en préparation n'est
+##       pas oublié (false).
 ##   Cache disque des niveaux : user://lodcache/<md5 du maillage>.bin
 ##       (en-tête "LODC" + version ; relu identique octet à octet, invalidé par
 ##       CACHE_VERSION ou par un changement des paramètres de construction).
@@ -267,7 +275,13 @@ func prepare_mesh(mesh: Mesh) -> bool:
 	var pending: bool = _pending.has(key)
 	_mutex.unlock()
 	if done:
-		reap()
+		# Seulement CE résultat : un `reap()` complet ici assemblait d'un coup tous
+		# les résultats finis (mesuré : 54 ms sur une image en vol, hors budget).
+		_mutex.lock()
+		var result: Dictionary = _results[key]
+		_results.erase(key)
+		_mutex.unlock()
+		_store(key, result)
 		return true
 	if not pending:
 		var params := _params()
@@ -281,19 +295,74 @@ func prepare_mesh(mesh: Mesh) -> bool:
 
 
 ## Libère les tâches de fond terminées et intègre leurs résultats ; renvoie le
-## nombre de tâches encore en cours.
-func reap() -> int:
+## nombre de tâches encore en cours. `budget_usec` > 0 : l'assemblage des
+## ArrayMesh (fil principal, ~0,1–2 ms par maillage) s'arrête une fois le budget
+## dépassé — les résultats restants sont gardés pour l'appel suivant (mesuré
+## avant : 66 ms d'un coup à 6 niveaux sur des tuiles de terrain en vol).
+func reap(budget_usec := 0) -> int:
+	var t0 := Time.get_ticks_usec()
 	_mutex.lock()
 	for key in _pending.keys():
 		if WorkerThreadPool.is_task_completed(_pending[key]):
 			WorkerThreadPool.wait_for_task_completion(_pending[key])
 			_pending.erase(key)
 	for key in _results.keys():
-		_store(key, _results[key])
-	_results.clear()
+		var result: Dictionary = _results[key]
+		# Un niveau (ArrayMesh) à la fois : un gros maillage (formation à 200 k
+		# triangles) coûtait 22 ms d'un bloc même sous budget.
+		var complete := true
+		while true:
+			if budget_usec > 0 and Time.get_ticks_usec() - t0 > budget_usec:
+				complete = false
+				break
+			if _assemble_one_level(result):
+				break
+		if not complete:
+			break
+		_store(key, result)
+		_results.erase(key)
 	var left := _pending.size()
 	_mutex.unlock()
 	return left
+
+
+## Résultats de tâches finies pas encore assemblés (en attente d'un `reap`).
+func unassembled_count() -> int:
+	_mutex.lock()
+	var n := _results.size()
+	_mutex.unlock()
+	return n
+
+
+## Oublie les niveaux construits d'un maillage : ArrayMesh des niveaux > 0 et
+## chaîne du sélecteur rendus (le maillage d'origine appartient à l'appelant).
+## false si rien n'était connu ou si une tâche de préparation est en cours.
+## À réserver aux maillages qu'aucune cellule vivante n'utilise.
+func forget_mesh(mesh: Mesh) -> bool:
+	var key := mesh.get_rid()
+	_mutex.lock()
+	var pending: bool = _pending.has(key)
+	if not pending:
+		_results.erase(key)  # résultat fini jamais assemblé : rien à construire
+	_mutex.unlock()
+	if pending or not _lod_cache.has(key):
+		return false
+	var lod: Dictionary = _lod_cache[key]
+	lod_mesh_count -= (lod["meshes"] as Array).size() - 1
+	_lod_cache.erase(key)
+	for ck in _chain_cache.keys():
+		if ck[0] == key:
+			_chain_cache.erase(ck)  # l'emplacement de chaîne du sélecteur (≤ max_levels floats) reste alloué côté Rust
+	return true
+
+
+## `forget_mesh` sur tous les maillages d'une scène ; renvoie le nombre oubliés.
+func forget_scene(scene: Node3D) -> int:
+	var n := 0
+	for p: Dictionary in _parts(scene):
+		if forget_mesh(p["mesh"]):
+			n += 1
+	return n
 
 
 ## Attend toutes les tâches en cours (sortie, tests).
@@ -390,26 +459,40 @@ func _build_task(mesh: Mesh, params: Dictionary, surfaces: Array) -> void:
 
 
 ## Assemble les ArrayMesh des niveaux > 0 d'un résultat de `_build_task`
-## (fil principal uniquement).
+## (fil principal uniquement), tous d'un coup.
 static func _assemble_meshes(result: Dictionary) -> void:
+	while not _assemble_one_level(result):
+		pass
+
+
+## Assemble le prochain niveau > 0 d'un résultat ; true quand il n'en reste
+## plus (les tableaux de surface sont alors rendus). `meshes` grandit d'un
+## ArrayMesh par appel : un `reap` sous budget peut s'arrêter entre deux.
+static func _assemble_one_level(result: Dictionary) -> bool:
 	if not result.has("pending_levels"):
-		return
-	var mesh: Mesh = result["meshes"][0]
-	var surfaces: Array = result["surfaces"]
+		return true
 	var levels: Array = result["pending_levels"]
-	var meshes: Array = [mesh]
-	for level in range(1, levels.size()):
-		var am := ArrayMesh.new()
-		var per_surface: Array = levels[level]
-		for s in surfaces.size():
-			var arrays: Array = surfaces[s].duplicate()
-			arrays[Mesh.ARRAY_INDEX] = per_surface[s]
-			am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-			am.surface_set_material(s, mesh.surface_get_material(s))
-		meshes.append(am)
-	result["meshes"] = meshes
-	result.erase("pending_levels")
-	result.erase("surfaces")
+	var meshes: Array = result["meshes"]
+	var level := meshes.size()  # niveau 0 = maillage d'origine, déjà là
+	if level >= levels.size():
+		result.erase("pending_levels")
+		result.erase("surfaces")
+		return true
+	var mesh: Mesh = meshes[0]
+	var surfaces: Array = result["surfaces"]
+	var am := ArrayMesh.new()
+	var per_surface: Array = levels[level]
+	for s in surfaces.size():
+		var arrays: Array = surfaces[s].duplicate()
+		arrays[Mesh.ARRAY_INDEX] = per_surface[s]
+		am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		am.surface_set_material(s, mesh.surface_get_material(s))
+	meshes.append(am)
+	if meshes.size() >= levels.size():
+		result.erase("pending_levels")
+		result.erase("surfaces")
+		return true
+	return false
 
 
 ## Descripteur des niveaux (indices par niveau et par surface, erreurs, sphère),
