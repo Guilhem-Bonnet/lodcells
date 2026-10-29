@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    name: cargo test + Godot headless
+    runs-on: ubuntu-latest
+    env:
+      GODOT_VERSION: 4.7.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests Rust (lodcells-core)
+        run: cargo test --workspace --locked
+      - name: Build GDExtension
+        run: sh tools/build.sh
+      - name: Godot headless
+        run: |
+          set -eu
+          curl -sSL -o godot.zip "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q godot.zip && mv Godot_v${GODOT_VERSION}-stable_linux.x86_64 godot-bin && chmod +x godot-bin
+          ./godot-bin --headless --path godot --import >/dev/null 2>&1 || true
+          ./godot-bin --headless --path godot --script res://tests/test_lodcells.gd
