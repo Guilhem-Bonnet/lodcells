@@ -53,7 +53,7 @@ mod tests {
         let tri = IndexedMesh::new(vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], vec![0, 1, 2]);
         let bad = IndexedMesh::new(vec![[0.0; 3]], vec![0, 0, 7]);
         let chain = LodChain {
-            levels: vec![LodLevel { mesh: tri.clone(), error: 0.0 }, LodLevel { mesh: bad, error: 0.0 }],
+            levels: vec![LodLevel { mesh: tri.clone(), error: 0.0, source_indices: vec![0, 1, 2] }, LodLevel { mesh: bad, error: 0.0, source_indices: vec![] }],
             center: [0.0; 3],
             radius: 1.0,
         };
@@ -62,6 +62,6 @@ mod tests {
         assert!(issues.contains(&Issue::NotCoarser { level: 1 }));
         assert!(issues.contains(&Issue::IndexOutOfRange { level: 1, index: 7 }));
         assert!(issues.contains(&Issue::DegenerateTriangle { level: 1, tri: 0 }));
-        assert!(validate(&LodChain { levels: vec![LodLevel { mesh: tri, error: 0.0 }], center: [0.0; 3], radius: 1.0 }).is_empty());
+        assert!(validate(&LodChain { levels: vec![LodLevel { mesh: tri, error: 0.0, source_indices: vec![0, 1, 2] }], center: [0.0; 3], radius: 1.0 }).is_empty());
     }
 }

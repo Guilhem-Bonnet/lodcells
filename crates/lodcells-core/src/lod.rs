@@ -30,6 +30,12 @@ pub struct LodLevel {
     pub mesh: IndexedMesh,
     /// Erreur géométrique cumulée, en unités du maillage (rayon de déviation).
     pub error: f32,
+    /// Mêmes triangles que `mesh.indices`, mais indexés dans le tampon de
+    /// sommets **d'origine** (avant soudure) : un moteur peut ainsi
+    /// construire le niveau avec les attributs d'origine (normales, UV,
+    /// matériau) sans toucher à ses sommets. Aux coutures soudées, c'est le
+    /// premier sommet d'origine de la position qui est retenu.
+    pub source_indices: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,9 +71,24 @@ impl Default for LodParams {
 impl LodChain {
     /// Construit la chaîne. Le niveau 0 est le maillage soudé (ou tel quel).
     pub fn build(source: &IndexedMesh, params: &LodParams) -> LodChain {
-        let base = if params.weld_tolerance > 0.0 { source.weld(params.weld_tolerance).0 } else { source.clone() };
+        // base soudée + représentant d'origine de chaque sommet soudé
+        let (base, representative) = if params.weld_tolerance > 0.0 {
+            let (welded, remap) = source.weld(params.weld_tolerance);
+            let mut rep = vec![u32::MAX; welded.positions.len()];
+            for (src, &w) in remap.iter().enumerate() {
+                if rep[w as usize] == u32::MAX {
+                    rep[w as usize] = src as u32;
+                }
+            }
+            (welded, rep)
+        } else {
+            (source.clone(), (0..source.positions.len() as u32).collect())
+        };
         let (center, radius) = base.bounding_sphere();
-        let mut levels = vec![LodLevel { mesh: base, error: 0.0 }];
+        // chaque niveau garde, par sommet compacté, son indice dans la base soudée
+        let mut to_base: Vec<u32> = (0..base.positions.len() as u32).collect();
+        let base_src: Vec<u32> = base.indices.iter().map(|&i| representative[i as usize]).collect();
+        let mut levels = vec![LodLevel { mesh: base, error: 0.0, source_indices: base_src }];
         for _ in 0..params.max_levels {
             let prev = levels.last().unwrap();
             let want = ((prev.mesh.indices.len() as f32) * params.ratio) as usize / 3 * 3;
@@ -80,9 +101,11 @@ impl LodChain {
                 break;
             }
             let step = step_error(&prev.mesh, &indices);
-            let mesh = compact(&prev.mesh, indices);
+            let source_indices = indices.iter().map(|&i| representative[to_base[i as usize] as usize]).collect();
+            let (mesh, kept) = compact(&prev.mesh, indices);
+            to_base = kept.iter().map(|&k| to_base[k as usize]).collect();
             let error = prev.error + step.max(1e-7 * radius.max(1.0));
-            levels.push(LodLevel { mesh, error });
+            levels.push(LodLevel { mesh, error, source_indices });
         }
         LodChain { levels, center, radius }
     }
@@ -129,22 +152,25 @@ fn step_error(src: &IndexedMesh, kept_indices: &[u32]) -> f32 {
     worst.sqrt()
 }
 
-/// Garde seulement les sommets référencés, renumérote.
-fn compact(src: &IndexedMesh, indices: Vec<u32>) -> IndexedMesh {
+/// Garde seulement les sommets référencés, renumérote ; renvoie aussi, pour
+/// chaque sommet compacté, son indice dans `src`.
+fn compact(src: &IndexedMesh, indices: Vec<u32>) -> (IndexedMesh, Vec<u32>) {
     let mut remap = vec![u32::MAX; src.positions.len()];
     let mut positions = Vec::new();
+    let mut kept = Vec::new();
     let indices = indices
         .into_iter()
         .map(|i| {
             let slot = &mut remap[i as usize];
             if *slot == u32::MAX {
                 positions.push(src.positions[i as usize]);
+                kept.push(i);
                 *slot = (positions.len() - 1) as u32;
             }
             *slot
         })
         .collect();
-    IndexedMesh { positions, indices }
+    (IndexedMesh { positions, indices }, kept)
 }
 
 #[cfg(test)]
@@ -200,6 +226,26 @@ mod tests {
         // et l'enveloppe ne rétrécit pas
         let (lo, hi) = coarse.aabb().unwrap();
         assert_eq!((lo, hi), ([0.0, 0.0, 0.0], [15.0, 0.0, 15.0]));
+    }
+
+    #[test]
+    fn source_indices_point_back_to_original_vertices() {
+        // grille 8×8 avec un sommet dupliqué (couture) : indice 64 = copie du sommet 9
+        let mut g = grid(8);
+        g.positions.push(g.positions[9]);
+        let n = g.positions.len();
+        let chain = LodChain::build(&g, &LodParams { target_error: 1.0, ..Default::default() });
+        for l in &chain.levels {
+            assert_eq!(l.source_indices.len(), l.mesh.indices.len());
+            for (k, &s) in l.source_indices.iter().enumerate() {
+                assert!((s as usize) < n, "indice source hors tampon");
+                // la position d'origine référencée est celle du sommet compacté
+                let p = l.mesh.positions[l.mesh.indices[k] as usize];
+                assert_eq!(g.positions[s as usize], p);
+            }
+        }
+        // la copie soudée n'est jamais référencée : son représentant est le sommet 9
+        assert!(chain.levels.iter().all(|l| !l.source_indices.contains(&64)));
     }
 
     #[test]

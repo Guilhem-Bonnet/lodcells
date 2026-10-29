@@ -1,2 +1,4 @@
 /target
 **/*.rs.bk
+/godot/addons/lodcells/bin/
+/godot/.godot/

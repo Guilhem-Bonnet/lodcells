@@ -1,0 +1,14 @@
+[package]
+name = "lodcells-godot"
+description = "Couche GDExtension de lodcells : construction des niveaux de LOD et sélection par cellule"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lodcells-core = { path = "../lodcells-core" }
+godot = { version = "0.5.5", features = ["api-4-7"] }

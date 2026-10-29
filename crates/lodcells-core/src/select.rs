@@ -122,7 +122,7 @@ mod tests {
 
     fn chain(errors: &[f32]) -> LodChain {
         LodChain {
-            levels: errors.iter().map(|&e| LodLevel { mesh: IndexedMesh::default(), error: e }).collect(),
+            levels: errors.iter().map(|&e| LodLevel { mesh: IndexedMesh::default(), error: e, source_indices: vec![] }).collect(),
             center: [0.0; 3],
             radius: 1.0,
         }

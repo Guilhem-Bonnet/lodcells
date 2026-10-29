@@ -1,0 +1,7 @@
+; Projet Godot minimal de lodcells : héberge l'addon et ses tests headless.
+config_version=5
+
+[application]
+
+config/name="lodcells"
+config/features=PackedStringArray("4.7")

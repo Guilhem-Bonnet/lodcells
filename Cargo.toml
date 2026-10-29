@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/lodcells-core"]
+members = ["crates/lodcells-core", "crates/lodcells-godot"]
 
 [workspace.package]
 version = "0.1.0"
