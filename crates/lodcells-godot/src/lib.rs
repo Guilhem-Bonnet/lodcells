@@ -31,14 +31,20 @@ pub struct LodBuilder {
     #[var]
     #[init(val = 4)]
     max_levels: i64,
-    /// Erreur maximale par étape, relative au rayon du maillage.
+    /// Erreur maximale par effondrement, relative au rayon du maillage
+    /// (1,0 = pas de limite pratique, cf. lodcells-core).
     #[var]
-    #[init(val = 0.05)]
+    #[init(val = 1.0)]
     target_error: f32,
     /// Soudure par position avant simplification (0 = désactivée).
     #[var]
     #[init(val = 1e-4)]
     weld_tolerance: f32,
+    /// Verrouille les sommets de bord (positions de bord identiques à tous les
+    /// niveaux : pas de fissure entre tuiles voisines à des niveaux différents).
+    #[var]
+    #[init(val = true)]
+    lock_border: bool,
 }
 
 #[godot_api]
@@ -51,6 +57,7 @@ impl LodBuilder {
         self.max_levels = p.max_levels as i64;
         self.target_error = p.target_error;
         self.weld_tolerance = p.weld_tolerance;
+        self.lock_border = p.lock_border;
     }
 
     /// Niveaux de LOD d'une surface. Renvoie {"levels": [PackedInt32Array…]
@@ -77,6 +84,7 @@ impl LodBuilder {
             max_levels: self.max_levels as usize,
             target_error: self.target_error,
             weld_tolerance: self.weld_tolerance,
+            lock_border: self.lock_border,
             ..LodParams::default()
         };
         let chain = match LodChain::build(&IndexedMesh::new(positions, indices), &params) {

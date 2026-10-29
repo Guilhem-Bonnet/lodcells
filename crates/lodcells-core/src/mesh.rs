@@ -44,24 +44,23 @@ impl IndexedMesh {
         (c, r)
     }
 
-    /// Nombre de sommets de bord : sommets touchés par une arête qui n'a pas
-    /// d'arête opposée (ouverte). Sert à mesurer ce que la simplification fait
+    /// Sommets de bord (un drapeau par sommet) : sommets touchés par une
+    /// demi-arête sans opposée (arête ouverte, portée par un seul triangle).
+    pub fn border_vertices(&self) -> Vec<bool> {
+        border_flags(&self.indices, self.positions.len())
+    }
+
+    /// Nombre de sommets de bord. Sert à mesurer ce que la simplification fait
     /// aux contours (coutures entre tuiles).
     pub fn border_vertex_count(&self) -> usize {
-        let mut edges: HashMap<(u32, u32), u32> = HashMap::new();
-        for t in self.indices.as_chunks::<3>().0 {
-            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                *edges.entry((a, b)).or_default() += 1;
-            }
-        }
-        let mut border = vec![false; self.positions.len()];
-        for &(a, b) in edges.keys() {
-            if !edges.contains_key(&(b, a)) {
-                border[a as usize] = true;
-                border[b as usize] = true;
-            }
-        }
-        border.iter().filter(|b| **b).count()
+        self.border_vertices().iter().filter(|b| **b).count()
+    }
+
+    /// Positions des sommets de bord, triées (comparaison entre niveaux).
+    pub fn border_positions(&self) -> Vec<[f32; 3]> {
+        let mut out: Vec<[f32; 3]> = self.positions.iter().zip(self.border_vertices()).filter(|(_, b)| *b).map(|(p, _)| *p).collect();
+        out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        out
     }
 
     /// Soudure par position : les sommets dont les positions tombent dans la
@@ -91,6 +90,27 @@ impl IndexedMesh {
         indices = kept;
         (IndexedMesh { positions, indices }, remap)
     }
+}
+
+/// Drapeaux de bord d'une liste de triangles sur `vertex_count` sommets : un
+/// sommet est de bord s'il porte une demi-arête `(a, b)` sans opposée `(b, a)`.
+/// La topologie est celle des indices tels quels : pour raisonner en
+/// positions (coutures d'attributs exclues), passer des indices soudés.
+pub fn border_flags(indices: &[u32], vertex_count: usize) -> Vec<bool> {
+    let mut edges: HashMap<(u32, u32), u32> = HashMap::with_capacity(indices.len());
+    for t in indices.as_chunks::<3>().0 {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            *edges.entry((a, b)).or_default() += 1;
+        }
+    }
+    let mut border = vec![false; vertex_count];
+    for &(a, b) in edges.keys() {
+        if !edges.contains_key(&(b, a)) {
+            border[a as usize] = true;
+            border[b as usize] = true;
+        }
+    }
+    border
 }
 
 #[cfg(test)]

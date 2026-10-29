@@ -212,6 +212,16 @@ func _init() -> void:
 	_check(node8.cache_misses == 1 and FileAccess.get_file_as_bytes(cache_path) == bytes, "version périmée : reconstruit et fichier réécrit à l'identique")
 	# paramètres différents ⇒ autre clé
 	_check(LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 4}) != LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 2}), "la clé dépend des paramètres")
+	_check(LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 4, "lock_border": true}) != LodCellsScript.cache_key([arrays], {"ratio": 0.5, "target_error": 1.0, "weld_tolerance": 0.0001, "max_levels": 4, "lock_border": false}), "la clé dépend de lock_border")
+	# 6b. lock_border atteint LodBuilder : sans verrou, le dernier niveau de la
+	# grille (bords alignés, plan) compte moins de triangles qu'avec.
+	var lb = ClassDB.instantiate("LodBuilder")
+	lb.target_error = 1.0
+	lb.lock_border = false
+	var r_free: Dictionary = lb.build(arrays[Mesh.ARRAY_VERTEX], arrays[Mesh.ARRAY_INDEX])
+	var last_locked: int = tris[tris.size() - 1]
+	var last_free: int = (r_free["triangles"] as PackedInt32Array)[(r_free["triangles"] as PackedInt32Array).size() - 1]
+	_check(lb.lock_border == false and last_free < last_locked, "lock_border=false : dernier niveau %d triangles contre %d verrouillé" % [last_free, last_locked])
 
 	# 7. Construction hors fil principal : prepare_scene lance la tâche, reap()
 	# la récolte, add_cell n'a plus rien à construire (pas de LodBuilder sur le

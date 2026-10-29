@@ -30,7 +30,7 @@ extends Node3D
 ## de l'origine, le GPU ne manipule que de petits nombres.
 
 ## Version du format du cache disque : à incrémenter si le contenu change.
-const CACHE_VERSION := 1
+const CACHE_VERSION := 4  # 4 : choix du sommet d'origine par cosinus (plus par produit scalaire brut) ; 3 : bords verrouillés, coutures respectées, erreur de surface (S11 ; 2 = entrées transitoires)
 const CACHE_MAGIC := "LODC"
 
 ## Taille de cellule (m). Même pas qu'un éventuel décalage d'origine.
@@ -44,8 +44,14 @@ const CACHE_MAGIC := "LODC"
 ## pas encore construits ; ils font partie de la clé du cache disque).
 @export var max_levels := 4
 @export var ratio := 0.5
-@export var target_error := 0.05
+## Erreur maximale par effondrement, relative au rayon (1,0 = pas de limite
+## pratique : la sélection repose sur l'erreur mesurée des niveaux).
+@export var target_error := 1.0
 @export var weld_tolerance := 0.0001
+## Sommets de bord (arêtes ouvertes) verrouillés : positions identiques à tous
+## les niveaux. Indispensable pour des tuiles jointives ; pour des objets
+## isolés à faces ouvertes (bâtiments), limite la simplification.
+@export var lock_border := true
 ## Marge d'hystérésis sur l'erreur projetée (0 = aucune) : évite le
 ## clignotement quand la caméra oscille autour d'un seuil.
 @export var hysteresis := 0.15
@@ -350,7 +356,7 @@ static func _surfaces_of(mesh: Mesh) -> Array:
 
 
 func _params() -> Dictionary:
-	return {"max_levels": max_levels, "ratio": ratio, "target_error": target_error, "weld_tolerance": weld_tolerance, "cache_dir": cache_dir}
+	return {"max_levels": max_levels, "ratio": ratio, "target_error": target_error, "weld_tolerance": weld_tolerance, "lock_border": lock_border, "cache_dir": cache_dir}
 
 
 ## Construit (ou relit du cache disque) les niveaux d'un maillage. Appelable
@@ -403,6 +409,7 @@ func _load_or_build(surfaces: Array, params: Dictionary) -> Dictionary:
 	builder.ratio = params["ratio"]
 	builder.target_error = params["target_error"]
 	builder.weld_tolerance = params["weld_tolerance"]
+	builder.lock_border = params.get("lock_border", true)
 	var per_surface: Array = []
 	var n_levels := 1 << 30
 	for arrays: Array in surfaces:
@@ -435,7 +442,7 @@ func _load_or_build(surfaces: Array, params: Dictionary) -> Dictionary:
 static func cache_key(surfaces: Array, params: Dictionary) -> String:
 	var ctx := HashingContext.new()
 	ctx.start(HashingContext.HASH_MD5)
-	ctx.update(("%d|%s|%s|%s|%d" % [CACHE_VERSION, params["ratio"], params["target_error"], params["weld_tolerance"], params["max_levels"]]).to_utf8_buffer())
+	ctx.update(("%d|%s|%s|%s|%d|%s" % [CACHE_VERSION, params["ratio"], params["target_error"], params["weld_tolerance"], params["max_levels"], params.get("lock_border", true)]).to_utf8_buffer())
 	for arrays: Array in surfaces:
 		ctx.update((arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).to_byte_array())
 		var idx: Variant = arrays[Mesh.ARRAY_INDEX]

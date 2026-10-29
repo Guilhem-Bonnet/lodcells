@@ -17,6 +17,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Clippy (aucun avertissement)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Banc 16 k / 64 k sommets (release, bords constants à tous les niveaux)
+        run: cargo test --release -p lodcells-core --locked -- --ignored bench --nocapture
       - name: Build GDExtension
         run: sh tools/build.sh
       - name: Godot headless
