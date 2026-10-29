@@ -317,6 +317,7 @@ func pending_count() -> int:
 func _store(key: RID, result: Dictionary) -> void:
 	if _lod_cache.has(key):
 		return
+	_assemble_meshes(result)
 	_lod_cache[key] = result
 	lod_mesh_count += (result["meshes"] as Array).size() - 1
 	if result.get("from_cache", false):
@@ -360,8 +361,8 @@ func _params() -> Dictionary:
 
 
 ## Construit (ou relit du cache disque) les niveaux d'un maillage. Appelable
-## depuis un fil de travail : LodBuilder local à la tâche, ArrayMesh créés hors
-## arbre (appels RenderingServer sans retour, donc sans synchronisation),
+## depuis un fil de travail : LodBuilder local à la tâche, AUCUN objet de rendu
+## créé (les ArrayMesh sont assemblés par `_store` sur le fil principal),
 ## résultat déposé sous mutex. `surfaces` : tableaux lus sur le fil principal.
 func _build_task(mesh: Mesh, params: Dictionary, surfaces: Array) -> void:
 	var key := mesh.get_rid()
@@ -377,20 +378,38 @@ func _build_task(mesh: Mesh, params: Dictionary, surfaces: Array) -> void:
 				result["errors"] = desc["errors"]
 				result["center"] = desc["center"]
 				result["radius"] = desc["radius"]
-				var meshes: Array = [mesh]
-				for level in range(1, n_levels):
-					var am := ArrayMesh.new()
-					var per_surface: Array = desc["levels"][level]
-					for s in surfaces.size():
-						var arrays: Array = surfaces[s].duplicate()
-						arrays[Mesh.ARRAY_INDEX] = per_surface[s]
-						am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
-						am.surface_set_material(s, mesh.surface_get_material(s))
-					meshes.append(am)
-				result["meshes"] = meshes
+				# Les ArrayMesh sont assemblés par `_store` sur le FIL PRINCIPAL :
+				# créer des maillages depuis un fil de travail est une course sur
+				# le serveur de rendu factice (headless : « Parameter m is null »,
+				# RID non initialisés, plantages intermittents d'autres scripts).
+				result["pending_levels"] = desc["levels"]
+				result["surfaces"] = surfaces
 	_mutex.lock()
 	_results[key] = result
 	_mutex.unlock()
+
+
+## Assemble les ArrayMesh des niveaux > 0 d'un résultat de `_build_task`
+## (fil principal uniquement).
+static func _assemble_meshes(result: Dictionary) -> void:
+	if not result.has("pending_levels"):
+		return
+	var mesh: Mesh = result["meshes"][0]
+	var surfaces: Array = result["surfaces"]
+	var levels: Array = result["pending_levels"]
+	var meshes: Array = [mesh]
+	for level in range(1, levels.size()):
+		var am := ArrayMesh.new()
+		var per_surface: Array = levels[level]
+		for s in surfaces.size():
+			var arrays: Array = surfaces[s].duplicate()
+			arrays[Mesh.ARRAY_INDEX] = per_surface[s]
+			am.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+			am.surface_set_material(s, mesh.surface_get_material(s))
+		meshes.append(am)
+	result["meshes"] = meshes
+	result.erase("pending_levels")
+	result.erase("surfaces")
 
 
 ## Descripteur des niveaux (indices par niveau et par surface, erreurs, sphère),
