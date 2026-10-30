@@ -20,8 +20,9 @@ struct LodCellsExtension;
 #[gdextension]
 unsafe impl ExtensionLibrary for LodCellsExtension {}
 
+/// `tool` : utilisable dans l'éditeur Godot (aperçu des cellules dans la vue 3D).
 #[derive(GodotClass)]
-#[class(base = RefCounted, init)]
+#[class(tool, base = RefCounted, init)]
 pub struct LodBuilder {
     /// Fraction de triangles visée à chaque niveau, dans ]0, 1[.
     #[var]
@@ -122,8 +123,9 @@ struct Cell {
     removed: bool,
 }
 
+/// `tool` : la sélection des niveaux tourne aussi dans l'éditeur.
 #[derive(GodotClass)]
-#[class(base = RefCounted, init)]
+#[class(tool, base = RefCounted, init)]
 pub struct LodSelector {
     chains: Vec<LodChain>,
     cells: Vec<Cell>,

@@ -1,3 +1,4 @@
+@tool
 extends Node3D
 ## LodCells : exemplaires statiques en MultiMesh par (maillage, niveau de LOD,
 ## cellule). Les niveaux sont construits par la GDExtension (lodcells-core :
@@ -65,6 +66,9 @@ const CACHE_MAGIC := "LODC"
 @export var hysteresis := 0.15
 ## Dossier du cache disque des niveaux ("" = pas de cache).
 @export var cache_dir := "user://lodcache"
+## Caméra de sélection des niveaux (non sauvegardée) ; null = voir
+## `selection_camera` (éditeur : caméra de la première vue 3D).
+var camera: Camera3D = null
 
 var instance_count := 0
 var multimesh_count := 0
@@ -614,11 +618,11 @@ func _chain_for(lod: Dictionary, scale: float) -> int:
 func _process(_delta: float) -> void:
 	if _selector == null or _cells.is_empty():
 		return
-	var cam := get_viewport().get_camera_3d()
+	var cam := selection_camera()
 	if cam == null:
 		return
 	_selector.hysteresis = hysteresis
-	_selector.begin_frame(to_local(cam.global_position), cam.fov, get_viewport().get_visible_rect().size.y)
+	_selector.begin_frame(to_local(cam.global_position), cam.fov, cam.get_viewport().get_visible_rect().size.y)
 	var changed: PackedInt32Array = _selector.select_changed(threshold_px)
 	for i in changed.size():
 		var level := changed[i]
@@ -634,6 +638,19 @@ func _process(_delta: float) -> void:
 		mmis[cell["level"]].visible = false
 		mmis[level].visible = true
 		cell["level"] = level
+
+
+## Caméra servant à la sélection : `camera` si posée ; dans l'éditeur, celle de
+## la première vue 3D (celle que l'on regarde : la caméra active du viewport de
+## la scène éditée n'est qu'un nœud de la scène) ; sinon celle du viewport.
+func selection_camera() -> Camera3D:
+	if camera != null and is_instance_valid(camera):
+		return camera
+	if Engine.is_editor_hint() and Engine.has_singleton("EditorInterface"):
+		var vp: Object = Engine.get_singleton("EditorInterface").call("get_editor_viewport_3d", 0)
+		if vp != null and vp.call("get_camera_3d") != null:
+			return vp.call("get_camera_3d")
+	return get_viewport().get_camera_3d() if is_inside_tree() else null
 
 
 ## Nombre de cellules réévaluées à la dernière image (diagnostic).
