@@ -302,6 +302,17 @@ func _init() -> void:
 	_check(not node11.forget_mesh(unknown_mesh), "forget_mesh d'un maillage inconnu : faux")
 	scene3.free()
 
+	# 12. Caméra de sélection : `camera` posée prioritaire ; hors éditeur, sans
+	# caméra ni arbre, aucune (pas d'erreur).
+	var node12 = LodCellsScript.new()
+	_check(node12.selection_camera() == null, "sans caméra ni arbre : selection_camera() = null")
+	var cam12 := Camera3D.new()
+	node12.camera = cam12
+	_check(node12.selection_camera() == cam12, "camera posée : utilisée pour la sélection")
+	cam12.free()
+	_check(node12.selection_camera() == null, "camera libérée : ignorée")
+	node12.free()
+
 	scene.free()
 	if _fails == 0:
 		print("TEST LODCELLS OK")
